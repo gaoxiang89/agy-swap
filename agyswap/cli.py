@@ -265,17 +265,35 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
 
 def cmd_statusline(sw, args) -> None:
     if args.setup:
-        command = "python -m agyswap.statusline"
-        if args.chain:
-            command += f' --chain "{args.chain}"'
-        # The snippet must be valid JSON, so inner quotes are escaped; and the
-        # path may contain brackets, so rich markup stays off.
-        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        from agyswap.statusline import wrapper_path, write_wrapper
+
+        chain = args.chain or ""
+        if args.install:
+            target = write_wrapper(chain)
+            console.print(f"[green]Wrote[/green] {target}\n")
+
+        target = wrapper_path()
+        command = target.name
+        if not target.exists():
+            # No launcher yet: name it anyway and tell them to create it, since
+            # a bare word is the only form that survives every spawn style.
+            console.print(
+                "[yellow]Run with --install first[/yellow] to create "
+                f"{target}, or write this yourself:\n"
+            )
+            chain_hint = f' --chain "{chain}"' if chain else ""
+            if sys.platform == "win32":
+                body = '  @"%USERPROFILE%\\.local\\bin\\agyswap.exe" statusline' + chain_hint
+            else:
+                body = "  #!/bin/sh\n  exec agyswap statusline" + chain_hint
+            console.print(body, markup=False, highlight=False, soft_wrap=True)
+            console.print()
+
         console.print("Add this to [bold]~/.gemini/settings.json[/bold]:\n")
         console.print(
             '  "statusLine": {\n'
             '    "type": "",\n'
-            f'    "command": "{escaped}",\n'
+            f'    "command": "{command}",\n'
             '    "enabled": true\n'
             "  }",
             markup=False,
@@ -284,18 +302,23 @@ def cmd_statusline(sw, args) -> None:
         )
         console.print()
         console.print(
-            "[dim]This captures agy's real quota windows "
-            "(gemini-weekly / 3p-weekly) with no network or token needed.[/dim]"
+            "[dim]agy reads this at startup -- restart it for the hook to take "
+            "effect. Quota then updates itself while agy runs.[/dim]"
         )
-        if args.chain:
+        if chain:
             console.print(
-                "[dim]--chain forwards the same input to your existing script.[/dim]"
+                f"[dim]--chain forwards the same stdin to '{chain}' and passes its "
+                "output through untouched.[/dim]"
             )
         return
 
     from agyswap.statusline import main as statusline_main
 
-    argv = ["--chain", args.chain] if args.chain else []
+    argv: list[str] = []
+    if args.chain:
+        argv += ["--chain", args.chain]
+    if args.install:
+        argv.append("--install")
     sys.exit(statusline_main(argv))
 
 
@@ -354,6 +377,8 @@ def main() -> None:
 
     p_statusline = sub.add_parser("statusline", help="capture quota from agy's status line")
     p_statusline.add_argument("--setup", action="store_true", help="print setup instructions")
+    p_statusline.add_argument("--install", action="store_true",
+                              help="write the agy-statusline launcher script")
     p_statusline.add_argument("--chain", help="also run this command, forwarding its output")
 
     args = parser.parse_args()

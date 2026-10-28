@@ -109,6 +109,57 @@ def _summary_line(data: dict) -> str:
     return "  ".join(parts)
 
 
+def _agyswap_executable() -> str:
+    """Absolute path to the ``agyswap`` launcher, if one is on PATH.
+
+    ``python -m agyswap.statusline`` is not reliable guidance: with ``uv tool``
+    or ``pipx`` installs the module lives in an isolated environment, so the
+    ``python`` that agy happens to spawn cannot import it.
+    """
+    import shutil
+
+    found = shutil.which("agyswap")
+    if found:
+        return found
+    return "agyswap"
+
+
+def wrapper_path() -> "Path":
+    """Where the single-word launcher lives: next to the agyswap executable."""
+    from pathlib import Path
+
+    executable = Path(_agyswap_executable())
+    if executable.is_absolute():
+        return executable.parent / ("agy-statusline.cmd" if sys.platform == "win32"
+                                    else "agy-statusline")
+    return Path.home() / ".local" / "bin" / "agy-statusline"
+
+
+def write_wrapper(chain: str) -> "Path":
+    """Write a launcher that needs no shell quoting in agy's settings.
+
+    agy may spawn the status-line command through a shell or directly; a single
+    bare word with no arguments sidesteps the question entirely, which matters
+    because a quoted Windows path would otherwise be passed through verbatim.
+    """
+    from pathlib import Path
+
+    executable = _agyswap_executable()
+    target = wrapper_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    chain_part = f' --chain "{chain}"' if chain else ""
+    if sys.platform == "win32":
+        text = f'@echo off\r\n"{executable}" statusline{chain_part}\r\n'
+    else:
+        text = f'#!/bin/sh\nexec "{executable}" statusline{chain_part}\n'
+
+    target.write_text(text, encoding="utf-8", newline="")
+    if sys.platform != "win32":
+        target.chmod(0o755)
+    return target
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     _configure_stdio()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -118,6 +169,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         index = argv.index("--chain")
         if index + 1 < len(argv):
             chain = argv[index + 1]
+
+    if "--install" in argv:
+        target = write_wrapper(chain)
+        print(f"wrote {target}")
+        return 0
 
     try:
         raw = sys.stdin.read()

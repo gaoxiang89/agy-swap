@@ -151,23 +151,39 @@ agy is the only source. It pushes a JSON blob to its configured status-line
 command ~3x/second, and that blob contains the real, windowed quota —
 `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` (plus `gemini-argon-wtu-weekly`
 on plans that include Gemini 4 Argon) — with no token and no network involved.
-Enable the hook in `~/.gemini/settings.json`:
+
+Wire it up in one command:
+
+```bash
+agyswap statusline --setup --install
+```
+
+That writes a tiny `agy-statusline` launcher next to the `agyswap` executable and
+prints the `statusLine` block to paste into `~/.gemini/settings.json`:
 
 ```json
 "statusLine": {
   "type": "",
-  "command": "python -m agyswap.statusline",
+  "command": "agy-statusline",
   "enabled": true
 }
 ```
 
-Already have a status-line script? Chain it so both run:
+Restart agy afterwards — it reads `settings.json` at startup. From then on, quota
+updates itself while you work.
 
-```json
-"command": "python -m agyswap.statusline --chain \"C:/path/to/your-statusline.bat\""
+The launcher exists because agy may spawn that command through a shell or
+directly; a single bare word with no arguments behaves the same either way,
+whereas `python -m agyswap.statusline` is unreliable under `uv tool`/`pipx`
+installs (the module lives in an isolated environment, not in agy's `python`).
+
+Already have a status-line script? Chain it — both run from the same stdin, and
+your script's output is forwarded verbatim:
+
+```bash
+agyswap statusline --setup --install --chain "agy-tps-statusline.bat"   # Windows
+agyswap statusline --setup --install --chain "agy-tps-statusline"       # Linux
 ```
-
-The chained command receives the same stdin and its output is forwarded verbatim.
 
 Readings are cached per account with their age, so once you have been on an
 account its usage stays visible after you switch away.
