@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from textual.binding import Binding
 from textual.widgets import ListView, Static
 
 from agyswap.tui.dashboard import AccountListScreen
 from agyswap.tui.widgets import AccountItem
-
-if TYPE_CHECKING:
-    from agyswap.tui.app import AgySwapApp
 
 
 class WatchScreen(AccountListScreen):

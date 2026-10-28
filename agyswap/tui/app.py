@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from functools import partial
-
 from textual.app import App
-from textual.binding import Binding
 from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from agyswap.tui.dashboard import DashboardScreen
-from agyswap.tui.watch import WatchScreen
 from agyswap.tui.theme import AGY_SWAP_DARK
+from agyswap.tui.watch import WatchScreen
 
 
 class AgySwapApp(App):
@@ -27,6 +24,7 @@ class AgySwapApp(App):
         self._sw = sw
         self._start = "watch" if start_watch else "dashboard"
         self._refreshing = False
+        self._action_busy = False
         self.threshold_pct = None
 
     def on_mount(self) -> None:
@@ -38,12 +36,14 @@ class AgySwapApp(App):
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self._tick()
 
+    # -- refresh loop -----------------------------------------------------
+
     def _tick(self) -> None:
         if self._refreshing:
             return
         self._refreshing = True
         self.run_worker(
-            partial(self._refresh_blocking),
+            self._refresh_blocking,
             thread=True,
             group="refresh",
             exit_on_error=False,
@@ -51,70 +51,98 @@ class AgySwapApp(App):
         )
 
     def _refresh_blocking(self) -> None:
+        """Runs off the UI thread: reading credentials can touch the keyring CLI.
+
+        Quota comes from the status-line cache, so this poll is purely local --
+        no network, nothing to rate-limit.
+        """
         try:
-            from agyswap.tui.quota_probe import fetch_and_cache
-            fetch_and_cache()
-            snap = self._sw.list_accounts()
-            self.call_from_thread(self._apply_snapshot, snap)
+            snapshot = self._sw.list_accounts()
         except Exception:
             self.call_from_thread(self._refresh_done)
+            return
+        self.call_from_thread(self._apply_snapshot, snapshot)
 
-    def _apply_snapshot(self, snap: list[dict]) -> None:
+    def _apply_snapshot(self, snapshot: list[dict]) -> None:
         self._refreshing = False
-        self.snapshot = snap
+        self.snapshot = snapshot
 
     def _refresh_done(self) -> None:
         self._refreshing = False
 
     def on_worker_state_changed(self, event) -> None:
-        if (
-            event.state is WorkerState.ERROR
-            and event.worker.group == "refresh"
-        ):
-            self._refreshing = False
-            msg = str(event.worker.error)
-            self.notify(f"Refresh failed: {msg}", severity="warning", timeout=6)
+        if event.state is WorkerState.ERROR and event.worker.group in ("refresh", "action"):
+            if event.worker.group == "refresh":
+                self._refreshing = False
+            self.notify(
+                f"Background task failed: {event.worker.error}",
+                severity="warning",
+                timeout=6,
+            )
 
     def request_refresh(self) -> None:
         self._tick()
 
-    def do_switch(self, number: str) -> None:
-        try:
-            self._sw.switch(str(number))
-        except Exception as e:
-            self.notify(f"Switch failed: {e}", severity="error")
+    # -- actions (all off the UI thread) ----------------------------------
+
+    def _run_action(self, action) -> None:
+        if self._action_busy:
+            self.notify("Still finishing the previous action…", timeout=2)
+            return
+        self._action_busy = True
+
+        def work() -> None:
+            try:
+                message = action()
+            except Exception as exc:
+                self.call_from_thread(self._finish_action, str(exc), "error")
+            else:
+                self.call_from_thread(self._finish_action, message, "information")
+
+        self.run_worker(work, thread=True, group="action", exit_on_error=False)
+
+    def _finish_action(self, message: str | None, severity: str) -> None:
+        self._action_busy = False
+        if message:
+            self.notify(message, severity=severity, timeout=4)
         self.request_refresh()
 
-    def do_toggle_disabled(self, number: str) -> None:
-        snap = self.snapshot
-        if snap is None:
-            return
+    def do_switch(self, number) -> None:
+        def action() -> str:
+            result = self._sw.switch(str(number))
+            return f"Activated {result['active']} (new agy sessions only)"
+
+        self._run_action(action)
+
+    def do_toggle_disabled(self, number) -> None:
+        snapshot = self.snapshot or []
         target_state = None
-        for r in snap:
-            if str(r["number"]) == str(number):
-                target_state = not r.get("disabled", False)
+        for row in snapshot:
+            if str(row["number"]) == str(number):
+                target_state = not row.get("disabled", False)
                 break
         if target_state is None:
             return
-        try:
-            self._sw.set_disabled(str(number), target_state)
-        except Exception as e:
-            self.notify(f"Failed: {e}", severity="error")
-        self.request_refresh()
 
-    def do_remove(self, number: str) -> None:
-        try:
-            self._sw.remove_account(str(number))
-        except Exception as e:
-            self.notify(f"Remove failed: {e}", severity="error")
-        self.request_refresh()
+        def action() -> str:
+            account = self._sw.set_disabled(str(number), target_state)
+            return f"{'Disabled' if target_state else 'Enabled'} #{account.number}"
+
+        self._run_action(action)
+
+    def do_remove(self, number) -> None:
+        def action() -> str:
+            account = self._sw.remove_account(str(number))
+            return f"Removed #{account.number} {account.email}"
+
+        self._run_action(action)
 
     def do_add_current(self) -> None:
-        try:
-            self._sw.add_current()
-        except Exception as e:
-            self.notify(f"Add failed: {e}", severity="error")
-        self.request_refresh()
+        def action() -> str:
+            account = self._sw.add_current()
+            return f"Added #{account.number} {account.email}"
+
+        self._run_action(action)
 
     def action_refresh_full(self) -> None:
         self.request_refresh()
@@ -127,5 +155,4 @@ class AgySwapApp(App):
 
 
 def run_tui(sw, start_watch: bool = False) -> None:
-    app = AgySwapApp(sw, start_watch=start_watch)
-    app.run()
+    AgySwapApp(sw, start_watch=start_watch).run()

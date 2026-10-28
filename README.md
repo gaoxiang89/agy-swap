@@ -1,22 +1,23 @@
 # agy-swap
 
-Multi-account switcher for Antigravity CLI (agy). Easily switch between multiple Google/Gemini accounts without logging out. Track Gemini API quota for every account in a live TUI dashboard.
+Multi-account switcher for Antigravity CLI (`agy`), with a live quota dashboard.
+Switch between Google/Gemini accounts without logging out, and watch every
+account's quota in a TUI.
+
+Works on **macOS, Linux and Windows 11** — credentials go through the OS keyring
+(Keychain / Secret Service / Credential Manager) with a file fallback when no
+keyring is available.
 
 ## Installation
 
-### Using uv (recommended)
-
 ```bash
-uv tool install agy-swap
+uv tool install agy-swap       # uv (recommended)
+pipx install agy-swap          # pipx
+uv tool upgrade agy-swap       # update
+pipx upgrade agy-swap
 ```
 
-### Using pipx
-
-```bash
-pipx install agy-swap
-```
-
-### From source
+From source:
 
 ```bash
 git clone https://github.com/pr656d/agy-swap.git
@@ -25,142 +26,171 @@ uv sync
 uv run agyswap help
 ```
 
-### Updating
-
-```bash
-uv tool upgrade agy-swap       # uv
-pipx upgrade agy-swap          # pipx
-```
-
 ## Usage
 
-### Add your first account
-
-Log into agy with your first account, then:
-
 ```bash
-agyswap add
+agyswap add                    # capture the current agy login as an account
+agyswap list                   # list accounts, tokens and quota
+agyswap switch                 # rotate to the next enabled account
+agyswap switch 2               # by slot number
+agyswap switch user@gmail.com  # by email
+agyswap switch work            # by alias
+agyswap disable 2              # hold out of rotation (keeps credentials)
+agyswap enable 2
+agyswap alias 2 work
+agyswap alias 2 --unset
+agyswap remove 2
+agyswap doctor                 # what agy-swap can see on this machine
 ```
 
-### Add more accounts
+Run `agyswap` with no arguments for the interactive dashboard.
 
-Log in with another account, then:
-
-```bash
-agyswap add
-```
-
-### Switch accounts
-
-Rotate to the next enabled account:
-
-```bash
-agyswap switch
-```
-
-Or switch to a specific account:
-
-```bash
-agyswap switch 2
-agyswap switch user@gmail.com
-agyswap switch work               # by alias, once set with `agyswap alias 2 work`
-```
-
-See them all at a glance:
-
-```bash
-agyswap list
-```
-
-### Interactive dashboard (TUI)
-
-Run `agyswap tui` for the full-screen dashboard — every account's 5-hour and weekly usage with live progress bars, reset times, and switching, all keyboard-driven. `agyswap watch` opens it straight to the live monitor.
-
-Keyboard shortcuts from the dashboard:
+### Dashboard
 
 | Key | Action |
 |-----|--------|
-| `s` | Open account picker to switch |
-| `w` | Switch to watch screen |
+| `s` | Switch accounts |
+| `w` | Watch screen |
 | `a` | Add current account |
-| `f` | Refresh |
-| `j`/`k` | Navigate menu |
-| `q` | Quit |
+| `f` | Refresh now |
+| `j` / `k` | Move |
+| `q` | Back / quit |
 
-### Aliases
+## Platform support
 
-```bash
-agyswap alias 2 work            # give account 2 the alias "work"
-agyswap alias 2 --unset         # remove alias
-agyswap alias                   # list all aliases
+| | macOS | Linux | Windows 11 |
+|---|---|---|---|
+| Credential store | Keychain (`security`) | Secret Service (`secret-tool`) | Credential Manager (`advapi32`) |
+| Keyring entry created by agy | yes | no (file only) | yes |
+| File fallback | yes | yes | yes |
+| No extra dependencies | yes | yes | yes |
+| Verified | code path only | full suite + CLI + TUI + Secret Service | full suite + CLI + TUI + WinCred |
+
+Nothing outside the standard library is used for credential access: the Windows
+backend talks to `advapi32` directly through `ctypes`, and the Linux backend
+shells out to `secret-tool` (part of `libsecret`) when it exists.
+
+On Linux agy itself only writes its token file — its binary contains WinCred
+support but no Secret Service code — so agy-swap never *creates* a Secret Service
+entry there. It only keeps one in sync if it already exists. Windows (WinCred)
+and macOS (Keychain) entries are written normally.
+
+If no keyring is usable (containers, WSL without a session bus, minimal Linux),
+agy-swap falls back to agy's own token file and keeps working. Force that mode
+with `AGYSWAP_DISABLE_KEYRING=1`.
+
+Run `agyswap doctor` to see exactly which path is in use:
+
 ```
-
-### Disable / enable
-
-Hold an account out of rotation without removing its credentials:
-
-```bash
-agyswap disable 2
-agyswap enable 2
-```
-
-### Remove an account
-
-```bash
-agyswap remove 2
+  keyring        wincred · available
+  token          keyring:wincred · 53m left
+  identity       you@example.com
+  accounts       2
+  quota cache    schema 2 · 2 entry(ies)
 ```
 
 ## Quota data
 
-Quota usage is fetched directly from Google's Cloud Code Assist API using each managed account's stored OAuth token — no running agy session needed. The TUI polls every 3 seconds and updates quota for **all** managed accounts automatically.
+agy is the only source. It pushes a JSON blob to its configured status-line
+command ~3x/second, and that blob contains the real, windowed quota —
+`gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`, each with a reset time — with
+no token and no network involved. Enable the hook in `~/.gemini/settings.json`:
 
-Per-model breakdown is stored in the cache and can be displayed by the TUI.
+```json
+"statusLine": {
+  "type": "",
+  "command": "python -m agyswap.statusline",
+  "enabled": true
+}
+```
+
+Already have a status-line script? Chain it so both run:
+
+```json
+"command": "python -m agyswap.statusline --chain \"C:/path/to/your-statusline.bat\""
+```
+
+The chained command receives the same stdin and its output is forwarded verbatim.
+
+Readings are cached per account with their age, so once you have been on an
+account its usage stays visible after you switch away.
+
+> **Why not call Google's quota API?** Because it does not answer for this
+> product. `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` returns
+> `403 PERMISSION_DENIED — "You do not have a valid license of this product"` for
+> Antigravity accounts, while `loadCodeAssist` on the same host accepts the same
+> token and reports the tier as `UNSUPPORTED_CLIENT` ("migrate to the Antigravity
+> suite"). Earlier versions probed that endpoint; it cost a request per minute
+> per account and mislabelled healthy accounts as "expired".
 
 ## Limitations
 
-- **Switch does not affect the current agy session** — agy reads its auth token at startup and caches it in memory. Switching accounts only replaces the token on disk/keychain. You must exit the current agy session (or open a new terminal) for the change to take effect. New agy invocations will pick up the swapped account.
-- **Switch does not affect the current agy session** — agy reads its auth token at startup and caches it in memory. Switching accounts only replaces the token on disk/keychain. You must exit the current agy session (or open a new terminal) for the change to take effect. New agy invocations will pick up the swapped account.
+- **Switching does not affect a running agy session.** agy reads its token at
+  startup and caches it in memory. Exit the session (or open a new terminal) for
+  the change to take effect.
+- **Quota is only known for accounts agy has reported on.** An account never used
+  since you installed agy-swap shows `no samples yet` rather than a guess.
+- Credential backups are base64-encoded, not encrypted. They are written
+  atomically and locked down (`0600` on POSIX, an ACL on Windows), but anyone
+  who can read your home directory as you can read them.
 
 ## How it works
 
-- Backs up OAuth tokens when you add an account (`~/.agy-swap/credentials/`)
-- Swaps only the account-specific login by replacing the active token and Google accounts file
-- Account credentials stored securely using platform-appropriate methods (macOS Keychain + file fallback)
-- Quota fetched directly from Google's Cloud Code Assist API (`cloudcode-pa.googleapis.com`) using each account's stored OAuth token — no dependency on a running agy session
+- Backs up the OAuth token per account in `~/.agy-swap/credentials/`
+- Switching rewrites the live token in **every** store agy might read: the OS
+  keyring and the token file(s), so the two can never drift apart
+- Account identity is read from the token itself — the signed `id_token` JWT in
+  the file, or the `id_token_email` field agy writes to the Credential Manager —
+  so it is correct offline and does not depend on any bookkeeping file agy may
+  drop
+- Rejects a switch whose stored token belongs to a different account than the
+  slot claims (prevents silently swapping in the wrong login)
 
-## Data locations
+agy has moved this data around across versions, so agy-swap reads and writes both
+known locations:
 
 | Data | Path |
-|------|------|
+|---|---|
+| Active token (agy ≥ 1.4) | `~/.gemini/jetski-standalone-oauth-token` |
+| Active token (older agy) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| Legacy account pointer | `~/.gemini/google_accounts.json` (only `active` is touched) |
 | Credential backups | `~/.agy-swap/credentials/` |
 | Account registry | `~/.agy-swap/sequence.json` |
 | Quota cache | `~/.agy-swap/cache/quota.json` |
 
-## Uninstall
+### Environment overrides
 
-Remove all data:
+| Variable | Effect |
+|---|---|
+| `AGY_GEMINI_DIR` | agy's config root (default `~/.gemini`) |
+| `AGYSWAP_DATA_DIR` | agy-swap's data root (default `~/.agy-swap`) |
+| `AGYSWAP_DISABLE_KEYRING` | `1` forces the file-only credential path |
+
+## Development
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+The suite runs against a throwaway home directory; it never touches your real
+credentials, and the Windows keyring test uses a separate credential target that
+it deletes afterwards.
+
+## Uninstall
 
 ```bash
 rm -rf ~/.agy-swap
-```
-
-Then uninstall the tool:
-
-```bash
-uv tool uninstall agy-swap
-# or
-pipx uninstall agy-swap
+uv tool uninstall agy-swap     # or: pipx uninstall agy-swap
 ```
 
 ## Requirements
 
 - Python 3.10+
-- Antigravity CLI (agy) installed and logged in
-- macOS, Linux
+- Antigravity CLI (`agy`) installed and logged in
 
 ## Acknowledgements
 
-Inspired by [claude-swap](https://github.com/realiti4/claude-swap) — multi-account switcher for Claude Code.
+Inspired by [claude-swap](https://github.com/realiti4/claude-swap).
 
 ## License
 

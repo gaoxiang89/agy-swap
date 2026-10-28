@@ -1,15 +1,47 @@
 import argparse
+import platform
 import sys
 
-from agyswap import __version__
-from agyswap.switcher import AgySwitcher, AccountNotFoundError, AgyError
-from agyswap.paths import GOOGLE_ACCOUNTS_PATH
+from agyswap import __version__, credentials, paths, quota
+from agyswap.switcher import AccountNotFoundError, AgyError, AgySwitcher, current_email
 
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
 console = Console()
+
+
+def platform_label() -> str:
+    """Human OS name.
+
+    ``platform.release()`` is useless here: Windows 11 still reports "10",
+    because the NT major version never moved.  The build number is what
+    actually distinguishes 11 (22000+).
+    """
+    if sys.platform == "win32":
+        try:
+            build = sys.getwindowsversion().build
+        except Exception:
+            build = 0
+        if build >= 22000:
+            return "Windows 11"
+        if build >= 10240:
+            return "Windows 10"
+        return f"Windows {platform.release()}"
+    if sys.platform == "darwin":
+        return f"macOS {platform.mac_ver()[0] or platform.release()}".strip()
+    return f"Linux {platform.release()}".strip()
+
+
+def _quota_summary(row: dict) -> str:
+    """One column can only say so much: report the most constrained window."""
+    windows = row.get("quota_windows") or []
+    if not windows:
+        status = row.get("quota_status") or "unknown"
+        return "—" if status in ("unknown", "") else status
+    worst = max(windows, key=lambda window: window["used_pct"])
+    return f"{worst['label']} {worst['used_pct']:.0f}%"
 
 
 def cmd_list(sw: AgySwitcher, args) -> None:
@@ -25,22 +57,26 @@ def cmd_list(sw: AgySwitcher, args) -> None:
     table.add_column("Alias")
     table.add_column("Status")
     table.add_column("Token")
+    table.add_column("Quota")
 
-    for r in rows:
-        num = str(r["number"])
-        email = r["email"]
-        alias = r["alias"] or ""
+    for row in rows:
         status_parts = []
-        if r["active"]:
+        if row["active"]:
             status_parts.append("[green]active[/green]")
-        if r["disabled"]:
+        if row["disabled"]:
             status_parts.append("[yellow]disabled[/yellow]")
         status = " ".join(status_parts) if status_parts else "[dim]—[/dim]"
-        token = "[green]✓[/green]" if r["has_token"] else "[red]✗[/red]"
-        table.add_row(num, email, alias, status, token)
+        token = "[green]✓[/green]" if row["has_token"] else "[red]✗[/red]"
+        table.add_row(
+            str(row["number"]),
+            row["email"],
+            row["alias"] or "",
+            status,
+            token,
+            _quota_summary(row),
+        )
 
     console.print(table)
-    console.print(f"\n[dim]Active account tracked at: {GOOGLE_ACCOUNTS_PATH}[/dim]")
 
 
 def cmd_status(sw: AgySwitcher, args) -> None:
@@ -57,108 +93,205 @@ def cmd_status(sw: AgySwitcher, args) -> None:
 
 
 def cmd_add(sw: AgySwitcher, args) -> None:
-    acc = sw.add_current(email_override=args.email)
-    console.print(f"[green]Added[/green] account #{acc.number}: {acc.email}")
+    try:
+        account = sw.add_current(email_override=args.email)
+    except (AgyError, AccountNotFoundError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    console.print(f"[green]Added[/green] account #{account.number}: {account.email}")
 
 
 def cmd_remove(sw: AgySwitcher, args) -> None:
     try:
-        acc = sw._resolve_account(args.identifier)
-        sw.remove_account(args.identifier)
-        console.print(f"[red]Removed[/red] account #{acc.number}: {acc.email}")
-    except AccountNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        account = sw.remove_account(args.identifier)
+    except AccountNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+    console.print(f"[red]Removed[/red] account #{account.number}: {account.email}")
 
 
 def cmd_switch(sw: AgySwitcher, args) -> None:
     try:
         result = sw.switch(args.identifier)
-        prev = result["previous"] or "(none)"
-        console.print(
-            f"Switched: [dim]{prev}[/dim] → [bold green]{result['active']}[/bold green]"
-        )
-    except (AgyError, AccountNotFoundError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+    except (AgyError, AccountNotFoundError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+    previous = result["previous"] or "(none)"
+    console.print(
+        f"Switched: [dim]{previous}[/dim] → [bold green]{result['active']}[/bold green]"
+    )
+    if not result.get("targets"):
+        console.print(
+            "[yellow]Warning:[/yellow] could not write the token to any store. "
+            "Run [bold]agyswap doctor[/bold]."
+        )
+    console.print(
+        "[dim]agy caches its token at startup — the change applies to new sessions.[/dim]"
+    )
 
 
 def cmd_disable(sw: AgySwitcher, args) -> None:
     try:
-        acc = sw.set_disabled(args.identifier, True)
-        console.print(f"[yellow]Disabled[/yellow] account #{acc.number}: {acc.email}")
-    except AccountNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        account = sw.set_disabled(args.identifier, True)
+    except AccountNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+    console.print(f"[yellow]Disabled[/yellow] account #{account.number}: {account.email}")
 
 
 def cmd_enable(sw: AgySwitcher, args) -> None:
     try:
-        acc = sw.set_disabled(args.identifier, False)
-        console.print(f"[green]Enabled[/green] account #{acc.number}: {acc.email}")
-    except AccountNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        account = sw.set_disabled(args.identifier, False)
+    except AccountNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+    console.print(f"[green]Enabled[/green] account #{account.number}: {account.email}")
 
 
 def cmd_alias(sw: AgySwitcher, args) -> None:
     try:
         if args.unset:
-            acc = sw.unalias(args.identifier)
-            console.print(f"Removed alias for #{acc.number}: {acc.email}")
+            account = sw.unalias(args.identifier)
+            console.print(f"Removed alias for #{account.number}: {account.email}")
         elif args.name:
-            acc = sw.alias(args.identifier, args.name)
-            console.print(f"Set alias [bold]'{args.name}'[/bold] for #{acc.number}: {acc.email}")
+            account = sw.alias(args.identifier, args.name)
+            console.print(
+                f"Set alias [bold]'{args.name}'[/bold] for #{account.number}: {account.email}"
+            )
         else:
             rows = sw.list_accounts()
             found = False
-            for r in rows:
-                if r["alias"]:
-                    console.print(f"  {r['number']}: {r['alias']} [dim]({r['email']})[/dim]")
+            for row in rows:
+                if row["alias"]:
+                    console.print(
+                        f"  {row['number']}: {row['alias']} [dim]({row['email']})[/dim]"
+                    )
                     found = True
             if not found:
                 console.print("[dim]No aliases set.[/dim]")
-    except AccountNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+    except AccountNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
 
 
 def cmd_tui(sw: AgySwitcher, args) -> None:
     try:
         from agyswap.tui.app import run_tui
-        run_tui(sw, start_watch=False)
-    except ImportError:
-        console.print("[red]TUI requires textual. Install:[/red]")
-        console.print("  pip install 'agy-swap[tui]'")
+    except ImportError as exc:
+        console.print(f"[red]TUI unavailable:[/red] {exc}")
+        console.print("Reinstall with: pip install --force-reinstall agy-swap")
         sys.exit(1)
+    run_tui(sw, start_watch=getattr(args, "command", "") == "watch")
 
 
-def cmd_watch(sw: AgySwitcher, args) -> None:
-    try:
-        from agyswap.tui.app import run_tui
-        run_tui(sw, start_watch=True)
-    except ImportError:
-        console.print("[red]TUI requires textual. Install:[/red]")
-        console.print("  pip install 'agy-swap[tui]'")
-        sys.exit(1)
+def cmd_doctor(sw: AgySwitcher, args) -> None:
+    """Print what agy-swap can actually see on this machine."""
+    from agyswap.timeutil import format_duration
+    import time
+
+    table = Table(box=box.SIMPLE_HEAD, show_header=False)
+    table.add_column("", style="dim", width=12)
+    table.add_column("")
+
+    table.add_row("version", __version__)
+    table.add_row(
+        "platform",
+        f"{platform_label()} · {sys.platform} · Python {platform.python_version()}",
+    )
+    table.add_row("gemini dir", str(paths.GEMINI_DIR) + ("" if paths.GEMINI_DIR.exists() else " [red](missing)[/red]"))
+
+    ring = credentials.keyring_status()
+    ring_state = "[green]available[/green]" if ring["available"] else "[yellow]not found[/yellow]"
+    table.add_row("keyring", f"{ring['backend']} · {ring_state}")
+
+    token, source = credentials.read_token()
+    if token:
+        email = credentials.email_from_token(token, allow_network=False)
+        expiry = credentials.token_expiry(token)
+        if expiry is None:
+            expiry_text = "unknown"
+        else:
+            delta = expiry - time.time()
+            expiry_text = "expired" if delta <= 0 else f"{format_duration(delta)} left"
+        table.add_row("token", f"{source} · {expiry_text}")
+        table.add_row("identity", email or "[yellow]unknown[/yellow]")
+
+        # agy can leave the keyring and the file holding *different* accounts
+        # (they are written at different times).  Say so rather than silently
+        # picking one and looking confident.
+        disagreement = credentials.token_sources_disagree()
+        if disagreement:
+            table.add_row("note", f"[yellow]{disagreement}[/yellow]")
+    else:
+        table.add_row("token", "[red]not found[/red]")
+        table.add_row("identity", current_email(allow_network=False) or "[yellow]unknown[/yellow]")
+
+    accounts = sw.list_accounts()
+    table.add_row("accounts", str(len(accounts)) if accounts else "[dim]none[/dim]")
+
+    cache = quota.load_cache()
+    entries = cache.get("accounts") or {}
+    if paths.QUOTA_CACHE.exists():
+        table.add_row(
+            "quota cache",
+            f"schema {cache.get('schema')} · {len(entries)} entry(ies) · {paths.QUOTA_CACHE}",
+        )
+    else:
+        table.add_row("quota cache", "[dim]empty — no samples yet[/dim]")
+
+    statusline_command = (
+        f'python -m agyswap.statusline --chain "{args.chain}"'
+        if getattr(args, "chain", None)
+        else "python -m agyswap.statusline"
+    )
+
+    console.print(table)
+    console.print(
+        "\n[dim]Status-line hook — quota with no token and no network:[/dim]\n"
+        f'  settings.json → statusLine.command = "{statusline_command}"'
+    )
+
+    if token and credentials.token_is_expired(token):
+        console.print(
+            "\n[yellow]The active token has expired.[/yellow] Run [bold]agy[/bold] once "
+            "to refresh it, or configure OAuth refresh (see README)."
+        )
 
 
 def cmd_statusline(sw, args) -> None:
     if args.setup:
-        module = "agyswap.statusline"
-        console.print("Add this alias to your shell:")
-        console.print(f"  alias agy='agy -S \"python3 -m {module}\" ")
+        command = "python -m agyswap.statusline"
+        if args.chain:
+            command += f' --chain "{args.chain}"'
+        # The snippet must be valid JSON, so inner quotes are escaped; and the
+        # path may contain brackets, so rich markup stays off.
+        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        console.print("Add this to [bold]~/.gemini/settings.json[/bold]:\n")
+        console.print(
+            '  "statusLine": {\n'
+            '    "type": "",\n'
+            f'    "command": "{escaped}",\n'
+            '    "enabled": true\n'
+            "  }",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
         console.print()
-        console.print("Or use it once:")
-        console.print(f"  agy -S \"python3 -m {module}\"")
-        console.print()
-        console.print("[dim]The statusline script captures quota data to[/dim]")
-        console.print(f"[dim]  ~/.agy-swap/cache/quota.json[/dim]")
-        console.print("[dim]so agyswap TUI can display it.[/dim]")
+        console.print(
+            "[dim]This captures agy's real quota windows "
+            "(gemini-weekly / 3p-weekly) with no network or token needed.[/dim]"
+        )
+        if args.chain:
+            console.print(
+                "[dim]--chain forwards the same input to your existing script.[/dim]"
+            )
         return
 
-    from agyswap.statusline import main as sl_main
-    sl_main()
+    from agyswap.statusline import main as statusline_main
+
+    argv = ["--chain", args.chain] if args.chain else []
+    sys.exit(statusline_main(argv))
 
 
 def main() -> None:
@@ -179,14 +312,15 @@ def main() -> None:
   agyswap alias 2 --unset  remove an alias
   agyswap tui              interactive dashboard
   agyswap watch            dashboard on the watch page
+  agyswap doctor           show what agy-swap can see on this machine
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     sub = parser.add_subparsers(dest="command")
 
-    p_list = sub.add_parser("list", help="list managed accounts")
-    p_status = sub.add_parser("status", help="show current active account")
+    sub.add_parser("list", help="list managed accounts")
+    sub.add_parser("status", help="show current active account")
     p_add = sub.add_parser("add", help="capture current agy login as a managed account")
     p_add.add_argument("--email", help="email for the account (auto-detected if omitted)")
 
@@ -210,16 +344,19 @@ def main() -> None:
     sub.add_parser("tui", help="launch interactive dashboard")
     sub.add_parser("watch", help="dashboard on the watch page")
 
-    p_sl = sub.add_parser("statusline", help="capture quota data from agy -S")
-    p_sl.add_argument("--setup", action="store_true",
-                      help="print setup instructions")
+    p_doctor = sub.add_parser("doctor", help="diagnose token/keyring/quota on this machine")
+    p_doctor.add_argument("--chain", help="status-line command to chain, for the hint")
+
+    p_statusline = sub.add_parser("statusline", help="capture quota from agy's status line")
+    p_statusline.add_argument("--setup", action="store_true", help="print setup instructions")
+    p_statusline.add_argument("--chain", help="also run this command, forwarding its output")
 
     args = parser.parse_args()
 
-    sw = AgySwitcher()
+    switcher = AgySwitcher()
 
     if not args.command:
-        cmd_tui(sw, args)
+        cmd_tui(switcher, args)
         return
 
     dispatch = {
@@ -233,13 +370,14 @@ def main() -> None:
         "enable": cmd_enable,
         "alias": cmd_alias,
         "tui": cmd_tui,
-        "watch": cmd_watch,
+        "watch": cmd_tui,
+        "doctor": cmd_doctor,
         "statusline": cmd_statusline,
     }
 
     handler = dispatch.get(args.command)
     if handler:
-        handler(sw, args)
+        handler(switcher, args)
 
 
 if __name__ == "__main__":

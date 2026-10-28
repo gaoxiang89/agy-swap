@@ -1,10 +1,9 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
+from agyswap.timeutil import now_iso
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+__all__ = ["Account", "SequenceData", "now_iso"]
 
 
 @dataclass

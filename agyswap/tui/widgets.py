@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
+from agyswap.timeutil import format_duration, parse_iso_ts
 from agyswap.tui.theme import (
     ACCENT,
     FOREGROUND,
     MUTED,
-    SEV_CRIT,
     SEV_WARN,
     TRACK,
     severity_color,
@@ -25,45 +25,39 @@ _BAR_HALF = "╸"
 _BAR_EMPTY = "─"
 _BAR_TICK = "┃"
 
+#: After this long without a fresh sample the bars are dimmed.
 STALE_OK_S = 180
 
-
-def format_duration(seconds: float) -> str:
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        h, m = divmod(s // 60, 60)
-        return f"{h}h {m}m" if m else f"{h}h"
-    d, h = divmod(s // 3600, 24)
-    return f"{d}d {h}h" if h else f"{d}d"
+__all__ = [
+    "AccountsPanel",
+    "AccountCard",
+    "AccountItem",
+    "MenuItem",
+    "account_card_text",
+    "bar_cells",
+    "format_duration",
+    "reset_clock",
+    "reset_text",
+    "usage_bar",
+    "usage_rows",
+]
 
 
 def reset_text(resets_at: str | None, now: float) -> str | None:
-    if not resets_at:
+    remaining = parse_iso_ts(resets_at)
+    if remaining is None:
         return None
-    try:
-        ts = datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-    remaining = ts - now
-    if remaining <= 0:
+    delta = remaining - now
+    if delta <= 0:
         return "resets now"
-    return f"resets {format_duration(remaining)}"
+    return f"resets {format_duration(delta)}"
 
 
 def reset_clock(resets_at: str | None, now: float) -> str | None:
-    if not resets_at:
+    timestamp = parse_iso_ts(resets_at)
+    if timestamp is None or timestamp - now <= 0:
         return None
-    try:
-        reset_utc = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if reset_utc.timestamp() - now <= 0:
-        return None
-    return reset_utc.astimezone().strftime("%H:%M")
+    return datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M")
 
 
 def bar_cells(
@@ -77,8 +71,8 @@ def bar_cells(
     if pct is None:
         text.append(_BAR_EMPTY * width, style=TRACK)
         return text
-    frac = min(max(pct, 0.0), 100.0) / 100.0
-    cells = frac * width
+    fraction = min(max(pct, 0.0), 100.0) / 100.0
+    cells = fraction * width
     full = int(cells)
     half = (cells - full) >= 0.5 and full < width
     tick_at: int | None = None
@@ -86,12 +80,12 @@ def bar_cells(
         tick_at = min(width - 1, max(0, round(threshold / 100.0 * width)))
     color = severity_color(pct)
     fill_style = f"{color} dim" if stale else color
-    for i in range(width):
-        if tick_at is not None and i == tick_at:
+    for index in range(width):
+        if tick_at is not None and index == tick_at:
             text.append(_BAR_TICK, style=SEV_WARN)
-        elif i < full:
+        elif index < full:
             text.append(_BAR_FILLED, style=fill_style)
-        elif i == full and half:
+        elif index == full and half:
             text.append(_BAR_HALF, style=fill_style)
         else:
             text.append(_BAR_EMPTY, style=TRACK)
@@ -121,18 +115,31 @@ def usage_bar(
 
 
 def usage_rows(acc: dict, now: float) -> list[tuple[str, float, str, str]]:
+    """Rows of ``(label, used_pct, short_suffix, long_suffix)``."""
     rows: list[tuple[str, float, str, str]] = []
-    for key, label, resets_key in (("five_hour", "5h", "five"), ("seven_day", "7d", "seven")):
-        pct = acc.get(f"quota_{key}")
+    for window in acc.get("quota_windows") or ():
+        pct = window.get("used_pct")
         if pct is None:
             continue
-        resets_at = acc.get(f"quota_{resets_key}_resets_at")
-        reset = reset_text(resets_at, now)
-        clock = reset_clock(resets_at, now) if reset else None
-        suffix = reset or ""
-        suffix_full = f"{reset} · {clock}" if (reset and clock) else suffix
-        rows.append((label, float(pct), suffix, suffix_full))
+        label = str(window.get("label") or window.get("key") or "?")
+        reset = reset_text(window.get("resets_at"), now)
+        clock = reset_clock(window.get("resets_at"), now) if reset else None
+        short = reset or ""
+        long = f"{reset} · {clock}" if (reset and clock) else short
+        rows.append((label, float(pct), short, long))
     return rows
+
+
+def _quota_placeholder(acc: dict) -> str:
+    status = acc.get("quota_status") or ""
+    detail = (acc.get("quota_detail") or "").strip()
+    if detail:
+        return detail
+    if status == "expired":
+        return "token expired — run agy to refresh"
+    if status == "untokened":
+        return "no stored token"
+    return "quota unavailable"
 
 
 def account_card_text(
@@ -157,23 +164,24 @@ def account_card_text(
 
     fetched_at = acc.get("quota_fetched_at")
     if fetched_at:
-        age_s = now - float(fetched_at)
-        if age_s > 0:
-            text.append(f"   {format_duration(age_s)} ago", style=MUTED)
+        age = now - float(fetched_at)
+        if age > 0:
+            text.append(f"   {format_duration(age)} ago", style=MUTED)
+    if acc.get("quota_status") == "expired":
+        text.append("   (expired)", style=MUTED)
 
     rows = usage_rows(acc, now)
     if not rows:
         text.append("\n    ")
-        text.append("quota unavailable", style=MUTED)
+        text.append(_quota_placeholder(acc), style=MUTED)
         return text
 
-    stale = fetched_at and (now - float(fetched_at)) > STALE_OK_S
-    label_width = max(len(label) for label, _pct, _suffix, _full in rows)
+    stale = bool(fetched_at) and (now - float(fetched_at)) > STALE_OK_S
+    label_width = max(len(label) for label, _pct, _short, _long in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
     row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
-    for label, pct, suffix, suffix_full in rows:
-        if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
-            suffix = suffix_full
+    for label, pct, short, long in rows:
+        suffix = long if (long != short and row_overhead + len(long) <= width) else short
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -185,43 +193,6 @@ def account_card_text(
                 threshold=threshold,
             )
         )
-    return text
-
-
-def mini_account_text(acc: dict, now: float) -> Text:
-    text = Text(no_wrap=True, overflow="ellipsis")
-    text.append(f"{acc['number']:>2}  ", style=f"bold {MUTED}")
-    if acc.get("alias"):
-        text.append(acc["alias"], style=f"bold {ACCENT}")
-        text.append(f" ({acc['email']})", style=FOREGROUND)
-    else:
-        text.append(acc["email"], style=FOREGROUND)
-    if acc.get("disabled"):
-        text.append("  (disabled)", style=MUTED)
-    text.append("   ")
-
-    fetched_at = acc.get("quota_fetched_at")
-    stale = fetched_at and (now - float(fetched_at)) > STALE_OK_S
-    parts = 0
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        pct = acc.get(f"quota_{key}")
-        if pct is None:
-            continue
-        pct = float(pct)
-        if parts:
-            text.append(" · ", style=TRACK)
-        color = severity_color(pct)
-        text.append(f"{label} ", style=MUTED)
-        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        if pct >= 100:
-            resets_key = "five" if key == "five_hour" else "seven"
-            resets_at = acc.get(f"quota_{resets_key}_resets_at")
-            reset = reset_text(resets_at, now)
-            if reset:
-                text.append(f" ({reset})", style=MUTED)
-        parts += 1
-    if not parts:
-        text.append("quota N/A", style=MUTED)
     return text
 
 
@@ -239,24 +210,20 @@ class AccountsPanel(Static):
             return Text("loading…", style=MUTED)
         if not snap:
             return Text(
-                "No managed accounts yet.\n"
-                "Use the menu below to add one.",
+                "No managed accounts yet.\nUse the menu below to add one.",
                 style=MUTED,
             )
         now = time.time()
         width = (self.size.width or 80) - 2
-        blocks: list[Text] = []
-        for r in snap:
-            blocks.append(
-                account_card_text(r, width, threshold=app.threshold_pct, now=now)
-            )
-        if not blocks:
-            return Text("no active managed login", style=MUTED)
+        blocks: list[Text] = [
+            account_card_text(row, width, threshold=app.threshold_pct, now=now)
+            for row in snap
+        ]
         text = Text()
         previous_multiline = False
-        for i, block in enumerate(blocks):
+        for index, block in enumerate(blocks):
             multiline = "\n" in block.plain
-            if i:
+            if index:
                 text.append("\n\n" if (multiline or previous_multiline) else "\n")
             text.append(block)
             previous_multiline = multiline
