@@ -146,13 +146,13 @@ account its usage stays visible after you switch away.
 - Rejects a switch whose stored token belongs to a different account than the
   slot claims (prevents silently swapping in the wrong login)
 
-agy has moved this data around across versions, so agy-swap reads and writes both
-known locations:
+agy names its token file per platform rather than per version, so agy-swap
+probes both locations and uses whichever holds the fresher token:
 
 | Data | Path |
 |---|---|
-| Active token (agy ≥ 1.4) | `~/.gemini/jetski-standalone-oauth-token` |
-| Active token (older agy) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| Active token (Windows) | `~/.gemini/jetski-standalone-oauth-token` |
+| Active token (Linux, and some older builds) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
 | Legacy account pointer | `~/.gemini/google_accounts.json` (only `active` is touched) |
 | Credential backups | `~/.agy-swap/credentials/` |
 | Account registry | `~/.agy-swap/sequence.json` |

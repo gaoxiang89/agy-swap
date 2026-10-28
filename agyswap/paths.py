@@ -35,9 +35,12 @@ BACKUP_ROOT = _root_from_env("AGYSWAP_DATA_DIR", Path.home() / ".agy-swap")
 #: Per-version state directory inside agy's root.
 AGY_CLI_DIR = GEMINI_DIR / "antigravity-cli"
 
-#: Where agy >= 1.4 keeps its OAuth token (verified against agy.exe 1.4.3).
+#: agy's token file name/location depends on the platform rather than the
+#: version: Windows builds write ``jetski-standalone-oauth-token`` at the root,
+#: Linux builds keep ``antigravity-cli/antigravity-oauth-token``.  Both are
+#: probed and the freshest token wins, so it does not matter which one a given
+#: build maintains.
 TOKEN_PATH = GEMINI_DIR / "jetski-standalone-oauth-token"
-#: Where older agy builds kept it.  Read as a fallback, written only if present.
 LEGACY_TOKEN_PATH = AGY_CLI_DIR / "antigravity-oauth-token"
 #: Probe order for reading; all existing entries are rewritten on switch.
 TOKEN_CANDIDATES = (TOKEN_PATH, LEGACY_TOKEN_PATH)
