@@ -28,7 +28,12 @@ def platform_label() -> str:
             return "Windows 11"
         if build >= 10240:
             return "Windows 10"
-        return f"Windows {platform.release()}"
+        # platform.release() itself calls getwindowsversion(), so it can fail for
+        # the very reason this branch exists.
+        try:
+            return f"Windows {platform.release()}"
+        except Exception:
+            return "Windows"
     if sys.platform == "darwin":
         return f"macOS {platform.mac_ver()[0] or platform.release()}".strip()
     return f"Linux {platform.release()}".strip()

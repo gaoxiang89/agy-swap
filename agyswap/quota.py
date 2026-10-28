@@ -57,10 +57,12 @@ from agyswap import credentials, paths
 
 SCHEMA = 2
 
-#: Short, bar-friendly labels.  Unknown keys fall back to the raw key.
+#: Short, bar-friendly labels.  Unknown keys fall back to :func:`_compact_key`.
 WINDOW_LABELS = {
     "gemini-5h": "gemini 5h",
     "gemini-weekly": "gemini 7d",
+    # Argon (the compute-heavy Gemini 4 family) carries its own weekly budget.
+    "gemini-argon-wtu-weekly": "argon 7d",
     "3p-5h": "3p 5h",
     "3p-weekly": "3p 7d",
     # older agy releases
@@ -70,11 +72,15 @@ WINDOW_LABELS = {
 WINDOW_ORDER = (
     "gemini-5h",
     "gemini-weekly",
+    "gemini-argon-wtu-weekly",
     "3p-5h",
     "3p-weekly",
     "five_hour",
     "seven_day",
 )
+
+#: Longest label the card will spend on a bar prefix.
+MAX_LABEL_LEN = 14
 
 #: Samples older than this are dimmed in the UI.
 STALE_OK_S = 180
@@ -96,8 +102,36 @@ def _num(value: Any) -> Optional[float]:
         return None
 
 
+#: Trailing window markers -> short suffix.
+_WINDOW_SUFFIXES = (
+    ("-weekly", "7d"),
+    ("-5h", "5h"),
+    ("-daily", "1d"),
+    ("-hourly", "1h"),
+)
+
+
+def _compact_key(key: str) -> str:
+    """Turn an unknown window key into something that fits a bar prefix.
+
+    agy adds windows as plans change -- ``gemini-argon-wtu-weekly`` appeared with
+    Gemini 4 Argon -- and a raw 23-character key would eat the whole row.  Known
+    keys have hand-written labels; everything else gets a mechanical shortening
+    so a future window degrades instead of wrecking the layout.
+    """
+    text = key.replace("_", "-").lower()
+    suffix = ""
+    for token, short in _WINDOW_SUFFIXES:
+        if text.endswith(token):
+            text, suffix = text[: -len(token)], short
+            break
+    text = text.removeprefix("gemini-").replace("-wtu", "")
+    label = f"{text} {suffix}".strip() if suffix else text
+    return label[:MAX_LABEL_LEN]
+
+
 def window_label(key: str) -> str:
-    return WINDOW_LABELS.get(key, key)
+    return WINDOW_LABELS.get(key) or _compact_key(key)
 
 
 def _read_json(path) -> dict:

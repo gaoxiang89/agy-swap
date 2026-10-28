@@ -28,6 +28,11 @@ REAL_STATUSLINE = {
             "reset_time": "2026-10-28T14:02:44Z",
             "reset_in_seconds": 18000,
         },
+        "gemini-argon-wtu-weekly": {
+            "remaining_fraction": 0.935,
+            "reset_time": "2026-10-31T01:28:07Z",
+            "reset_in_seconds": 230546,
+        },
         "gemini-weekly": {
             "remaining_fraction": 0.969828,
             "reset_time": "2026-11-02T07:35:46Z",
@@ -45,11 +50,21 @@ class StatuslineMappingTest(unittest.TestCase):
         mapped = quota.map_statusline(REAL_STATUSLINE)
         windows = mapped["windows"]
         self.assertEqual(
-            set(windows), {"3p-5h", "3p-weekly", "gemini-5h", "gemini-weekly"}
+            set(windows),
+            {
+                "3p-5h",
+                "3p-weekly",
+                "gemini-5h",
+                "gemini-argon-wtu-weekly",
+                "gemini-weekly",
+            },
         )
         self.assertEqual(windows["gemini-5h"]["used_pct"], 0.0)
         self.assertEqual(windows["3p-weekly"]["used_pct"], 0.0)
         self.assertAlmostEqual(windows["gemini-weekly"]["used_pct"], 3.0, places=1)
+        self.assertAlmostEqual(
+            windows["gemini-argon-wtu-weekly"]["used_pct"], 6.5, places=1
+        )
         self.assertEqual(windows["gemini-weekly"]["resets_at"], "2026-11-02T07:35:46Z")
 
     def test_legacy_rate_limits_shape(self):
@@ -69,6 +84,32 @@ class StatuslineMappingTest(unittest.TestCase):
     def test_ignores_malformed_entries(self):
         payload = {"quota": {"broken": "nope", "gemini-weekly": {"remaining_fraction": None}}}
         self.assertEqual(quota.map_statusline(payload)["windows"], {})
+
+
+class WindowLabelTest(unittest.TestCase):
+    def test_known_labels(self):
+        self.assertEqual(quota.window_label("gemini-5h"), "gemini 5h")
+        self.assertEqual(quota.window_label("gemini-weekly"), "gemini 7d")
+        self.assertEqual(quota.window_label("gemini-argon-wtu-weekly"), "argon 7d")
+        self.assertEqual(quota.window_label("3p-5h"), "3p 5h")
+        self.assertEqual(quota.window_label("five_hour"), "5h")
+
+    def test_unknown_key_is_compacted(self):
+        """A future window must not eat the row width."""
+        for key, expected in (
+            ("gemini-argon-wtu-weekly", "argon 7d"),
+            ("some-new-weekly", "some-new 7d"),
+            ("brand-new-daily", "brand-new 1d"),
+            ("mystery-window", "mystery-window"),
+        ):
+            self.assertEqual(quota.window_label(key), expected, key)
+
+    def test_unknown_labels_respect_max_length(self):
+        label = quota.window_label("a-very-long-unknown-window-name-with-no-suffix")
+        self.assertLessEqual(len(label), quota.MAX_LABEL_LEN)
+
+    def test_empty_key_does_not_crash(self):
+        self.assertEqual(quota.window_label(""), "")
 
 
 class DisplayTest(unittest.TestCase):
@@ -165,7 +206,7 @@ class DescribeTest(unittest.TestCase):
         info = quota.describe("user@example.com")
         self.assertEqual(
             [w["label"] for w in info["windows"]],
-            ["gemini 5h", "gemini 7d", "3p 5h", "3p 7d"],
+            ["gemini 5h", "gemini 7d", "argon 7d", "3p 5h", "3p 7d"],
         )
         self.assertEqual(info["status"], "ok")
         self.assertEqual(info["detail"], "")
@@ -175,7 +216,7 @@ class DescribeTest(unittest.TestCase):
         quota.statusline_capture(REAL_STATUSLINE)
         cache = quota.load_cache()
         info = quota.describe("user@example.com", cache)
-        self.assertEqual(len(info["windows"]), 4)
+        self.assertEqual(len(info["windows"]), 5)
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ class ListAndStatusTest(SwitcherTestCase):
         self.assertTrue(row["has_token"])
         self.assertEqual(
             [w["label"] for w in row["quota_windows"]],
-            ["gemini 5h", "gemini 7d", "3p 5h", "3p 7d"],
+            ["gemini 5h", "gemini 7d", "argon 7d", "3p 5h", "3p 7d"],
         )
         self.assertEqual(row["quota_status"], "ok")
 
