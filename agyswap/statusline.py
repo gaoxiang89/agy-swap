@@ -183,11 +183,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not raw.strip():
         return 0
 
+    # Run the chained script first and unconditionally: if our own parsing ever
+    # fails, the user's status line must still appear. Losing someone's tok/s
+    # readout because agy changed its payload shape would be a bad trade.
+    forwarded = _run_chain(chain, raw) if chain else ""
+
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        if forwarded:
+            print(forwarded, flush=True)
         return 0
     if not isinstance(data, dict):
+        if forwarded:
+            print(forwarded, flush=True)
         return 0
 
     try:
@@ -195,11 +204,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception:
         pass
 
-    if chain:
-        forwarded = _run_chain(chain, raw)
-        if forwarded:
-            print(forwarded, flush=True)
-            return 0
+    if forwarded:
+        print(forwarded, flush=True)
+        return 0
 
     line = _summary_line(data)
     if line:

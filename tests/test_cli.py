@@ -100,5 +100,33 @@ class LauncherTest(unittest.TestCase):
             self.assertTrue(statusline._agyswap_executable().endswith("agyswap.EXE"))
 
 
+class ChainTest(unittest.TestCase):
+    """A chained script must never be dropped because of our own parsing."""
+
+    def _run(self, payload, chain_output):
+        import io
+
+        with mock.patch("sys.stdin", io.StringIO(payload)), mock.patch.object(
+            statusline, "_run_chain", return_value=chain_output
+        ), mock.patch("builtins.print") as printed:
+            code = statusline.main(["--chain", "whatever"])
+        return code, printed
+
+    def test_chain_output_survives_malformed_input(self):
+        code, printed = self._run("not json at all", "TOK/s")
+        self.assertEqual(code, 0)
+        printed.assert_called_with("TOK/s", flush=True)
+
+    def test_chain_output_survives_non_dict_json(self):
+        code, printed = self._run('["a", "b"]', "TOK/s")
+        self.assertEqual(code, 0)
+        printed.assert_called_with("TOK/s", flush=True)
+
+    def test_empty_input_is_a_no_op(self):
+        code, printed = self._run("   ", "TOK/s")
+        self.assertEqual(code, 0)
+        printed.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
