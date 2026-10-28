@@ -8,23 +8,79 @@ Works on **macOS, Linux and Windows 11** — credentials go through the OS keyri
 (Keychain / Secret Service / Credential Manager) with a file fallback when no
 keyring is available.
 
-## Installation
+> This is a fork of [pr656d/agy-swap](https://github.com/pr656d/agy-swap) adding
+> cross-platform support and a corrected quota model. The published PyPI package
+> is the upstream one; install from this repository instead (see below).
+
+## Install
+
+`agy-swap` is not published to PyPI from this fork, so every command below
+installs **from git**. That matters: `uv tool install agy-swap` would fetch the
+upstream release, which only works on macOS.
+
+### uv (recommended)
 
 ```bash
-uv tool install agy-swap       # uv (recommended)
-pipx install agy-swap          # pipx
-uv tool upgrade agy-swap       # update
+uv tool install --from "git+https://github.com/gaoxiang89/agy-swap" agy-swap
+```
+
+### pipx
+
+```bash
+pipx install "git+https://github.com/gaoxiang89/agy-swap"
+```
+
+### Pin a version
+
+Useful for keeping several machines identical:
+
+```bash
+uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@v0.2.0" agy-swap
+
+# no tag needed — any commit works
+uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@72288cc" agy-swap
+```
+
+### From a clone (development)
+
+```bash
+git clone https://github.com/gaoxiang89/agy-swap
+cd agy-swap
+uv tool install --editable --from . agy-swap
+```
+
+`--editable` links the source tree into the tool environment, so edits take
+effect immediately without reinstalling. Drop it if you want a stable snapshot;
+then re-run with `--refresh` after pulling changes.
+
+### Windows: command not found?
+
+uv installs to `%USERPROFILE%\.local\bin`. If `agyswap` is not on `PATH`:
+
+```powershell
+uv tool update-shell
+```
+
+### Update
+
+```bash
+uv tool upgrade agy-swap     # re-resolves from the recorded git source
 pipx upgrade agy-swap
 ```
 
-From source:
+`uv tool upgrade` follows whatever source the tool was installed from — it will
+not silently swap in the PyPI release.
+
+## First run
 
 ```bash
-git clone https://github.com/pr656d/agy-swap.git
-cd agy-swap
-uv sync
-uv run agyswap help
+agyswap doctor               # what agy-swap can see: keyring, token, identity
+agyswap add                  # capture the account agy is currently logged in as
+agyswap statusline --setup   # enable live quota (see "Quota data")
+agyswap                      # open the dashboard
 ```
+
+To add another account, log into it with `agy`, then run `agyswap add` again.
 
 ## Usage
 
@@ -93,8 +149,9 @@ Run `agyswap doctor` to see exactly which path is in use:
 
 agy is the only source. It pushes a JSON blob to its configured status-line
 command ~3x/second, and that blob contains the real, windowed quota —
-`gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`, each with a reset time — with
-no token and no network involved. Enable the hook in `~/.gemini/settings.json`:
+`gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` (plus `gemini-argon-wtu-weekly`
+on plans that include Gemini 4 Argon) — with no token and no network involved.
+Enable the hook in `~/.gemini/settings.json`:
 
 ```json
 "statusLine": {
@@ -130,6 +187,9 @@ account its usage stays visible after you switch away.
   the change to take effect.
 - **Quota is only known for accounts agy has reported on.** An account never used
   since you installed agy-swap shows `no samples yet` rather than a guess.
+- **Each machine has its own data.** `~/.agy-swap` (registry, backups, cache) is
+  per-machine; it is not synced. A WSL install and a Windows install keep
+  separate account lists.
 - Credential backups are base64-encoded, not encrypted. They are written
   atomically and locked down (`0600` on POSIX, an ACL on Windows), but anyone
   who can read your home directory as you can read them.
@@ -169,6 +229,9 @@ probes both locations and uses whichever holds the fresher token:
 ## Development
 
 ```bash
+git clone https://github.com/gaoxiang89/agy-swap
+cd agy-swap
+uv tool install --editable --from . agy-swap
 python -m unittest discover -s tests -t .
 ```
 
@@ -179,18 +242,19 @@ it deletes afterwards.
 ## Uninstall
 
 ```bash
-rm -rf ~/.agy-swap
 uv tool uninstall agy-swap     # or: pipx uninstall agy-swap
+rm -rf ~/.agy-swap             # drop accounts, backups and cache
 ```
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (uv and pipx fetch a suitable interpreter automatically)
 - Antigravity CLI (`agy`) installed and logged in
 
 ## Acknowledgements
 
-Inspired by [claude-swap](https://github.com/realiti4/claude-swap).
+Fork of [pr656d/agy-swap](https://github.com/pr656d/agy-swap), itself inspired by
+[claude-swap](https://github.com/realiti4/claude-swap).
 
 ## License
 
