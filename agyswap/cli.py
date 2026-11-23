@@ -1,6 +1,7 @@
 import argparse
 import platform
 import sys
+from pathlib import Path
 
 from agyswap import __version__, credentials, paths, quota
 from agyswap.switcher import AccountNotFoundError, AgyError, AgySwitcher, current_email
@@ -37,6 +38,11 @@ def platform_label() -> str:
     if sys.platform == "darwin":
         return f"macOS {platform.mac_ver()[0] or platform.release()}".strip()
     return f"Linux {platform.release()}".strip()
+
+
+def _source_label(source: str) -> str:
+    """Short name for a token store: ``keyring:wincred`` or the file's name."""
+    return source if source.startswith("keyring:") else Path(source).name
 
 
 def _quota_summary(row: dict) -> str:
@@ -99,11 +105,33 @@ def cmd_status(sw: AgySwitcher, args) -> None:
 
 def cmd_add(sw: AgySwitcher, args) -> None:
     try:
-        account = sw.add_current(email_override=args.email)
+        captured = sw.add_sources(email_override=args.email)
     except (AgyError, AccountNotFoundError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
-    console.print(f"[green]Added[/green] account #{account.number}: {account.email}")
+    if len(captured) == 1:
+        _source, account = captured[0]
+        console.print(f"[green]Added[/green] account #{account.number}: {account.email}")
+        return
+    console.print(f"[green]Added[/green] {len(captured)} live logins:")
+    for source, account in captured:
+        console.print(
+            f"  #{account.number} {account.email}  [dim]({_source_label(source)})[/dim]"
+        )
+
+
+def cmd_recover(sw: AgySwitcher, args) -> None:
+    recovered = sw.recover_accounts()
+    if not recovered:
+        console.print(
+            "[dim]Nothing to recover: every backup is already registered.[/dim]"
+        )
+        return
+    console.print(
+        f"[green]Recovered[/green] {len(recovered)} account(s) from backups:"
+    )
+    for account in recovered:
+        console.print(f"  #{account.number} {account.email}")
 
 
 def cmd_remove(sw: AgySwitcher, args) -> None:
@@ -209,30 +237,54 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
     ring_state = "[green]available[/green]" if ring["available"] else "[yellow]not found[/yellow]"
     table.add_row("keyring", f"{ring['backend']} · {ring_state}")
 
-    token, source = credentials.read_token()
-    if token:
-        email = credentials.email_from_token(token, allow_network=False)
-        expiry = credentials.token_expiry(token)
+    def _expiry_text(text: str) -> str:
+        expiry = credentials.token_expiry(text)
         if expiry is None:
-            expiry_text = "unknown"
-        else:
-            delta = expiry - time.time()
-            expiry_text = "expired" if delta <= 0 else f"{format_duration(delta)} left"
-        table.add_row("token", f"{source} · {expiry_text}")
-        table.add_row("identity", email or "[yellow]unknown[/yellow]")
+            return "unknown expiry"
+        delta = expiry - time.time()
+        return "expired" if delta <= 0 else f"{format_duration(delta)} left"
 
-        # agy can leave the keyring and the file holding *different* accounts
-        # (they are written at different times).  Say so rather than silently
-        # picking one and looking confident.
-        disagreement = credentials.token_sources_disagree()
-        if disagreement:
-            table.add_row("note", f"[yellow]{disagreement}[/yellow]")
-    else:
+    live = credentials.live_tokens()
+    if not live:
         table.add_row("token", "[red]not found[/red]")
-        table.add_row("identity", current_email(allow_network=False) or "[yellow]unknown[/yellow]")
+        table.add_row(
+            "identity",
+            current_email(allow_network=False) or "[yellow]unknown[/yellow]",
+        )
+    elif len(live) == 1:
+        source, text = live[-1]
+        table.add_row("token", f"{_source_label(source)} · {_expiry_text(text)}")
+        table.add_row(
+            "identity",
+            credentials.email_from_token(text, allow_network=False)
+            or "[yellow]unknown[/yellow]",
+        )
+    else:
+        # agy can leave two stores holding *different* accounts: a desktop
+        # login in Credential Manager next to an SSH login in the token file.
+        # Name each one instead of silently reporting the freshest.
+        table.add_row(
+            "tokens",
+            f"[yellow]{len(live)} different logins live[/yellow] · "
+            "'agyswap add' captures all of them",
+        )
+        for source, text in reversed(live):
+            email = credentials.email_from_token(text) or "unknown"
+            table.add_row(
+                "",
+                f"{_source_label(source)} · {email} · {_expiry_text(text)}",
+            )
 
     accounts = sw.list_accounts()
     table.add_row("accounts", str(len(accounts)) if accounts else "[dim]none[/dim]")
+
+    orphans = sw.orphan_backups()
+    if orphans:
+        table.add_row(
+            "backups",
+            f"[yellow]{len(orphans)} unregistered[/yellow] · "
+            "run 'agyswap recover' to adopt them",
+        )
 
     cache = quota.load_cache()
     entries = cache.get("accounts") or {}
@@ -256,7 +308,7 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
         f'  settings.json → statusLine.command = "{statusline_command}"'
     )
 
-    if token and credentials.token_is_expired(token):
+    if live and credentials.token_is_expired(live[-1][1]):
         console.print(
             "\n[yellow]The active token has expired.[/yellow] Run [bold]agy[/bold] once "
             "to refresh it, or configure OAuth refresh (see README)."
@@ -328,7 +380,8 @@ def main() -> None:
         description="Multi-account switcher for Antigravity CLI (agy)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  agyswap add              capture current login as a managed account
+  agyswap add              capture every live login as a managed account
+  agyswap recover          re-adopt accounts from orphaned token backups
   agyswap list             list managed accounts
   agyswap switch           rotate to next enabled account
   agyswap switch 2         switch to account #2
@@ -351,6 +404,11 @@ def main() -> None:
     sub.add_parser("status", help="show current active account")
     p_add = sub.add_parser("add", help="capture current agy login as a managed account")
     p_add.add_argument("--email", help="email for the account (auto-detected if omitted)")
+
+    sub.add_parser(
+        "recover",
+        help="re-register accounts whose token backups outlived the registry",
+    )
 
     p_switch = sub.add_parser("switch", help="switch accounts")
     p_switch.add_argument("identifier", nargs="?", help="account number, email, or alias")
@@ -393,6 +451,7 @@ def main() -> None:
         "list": cmd_list,
         "status": cmd_status,
         "add": cmd_add,
+        "recover": cmd_recover,
         "switch": cmd_switch,
         "remove": cmd_remove,
         "rm": cmd_remove,

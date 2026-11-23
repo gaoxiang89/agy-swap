@@ -313,6 +313,59 @@ def delete_token_backup(number: int, email: str) -> None:
         pass
 
 
+def email_from_backup_slug(slug: str) -> Optional[str]:
+    """Best-effort reverse of the file-name sanitising in :func:`backup_path`."""
+    if "_at_" not in slug:
+        return None
+    email = slug.replace("_at_", "@").replace("_dot_", ".")
+    return email if "@" in email else None
+
+
+def scan_token_backups() -> list[dict]:
+    """Decode every backup file in the credentials directory.
+
+    ``sequence.json`` is the only authority on which accounts are managed, and
+    the backups outlive it: after a lost or reset registry they are what makes
+    recovery possible.  Unreadable files are skipped rather than reported.
+
+    Each entry carries ``path``, ``number`` (the slot encoded in the file
+    name), ``slug`` (the sanitised address from the file name), ``token``,
+    ``email`` and ``expiry``.  ``email`` is ``None`` when the token itself
+    carries no identity, in which case ``slug`` is the only hint left.
+    """
+    entries: list[dict] = []
+    try:
+        files = sorted(paths.CREDENTIALS_DIR.glob(".creds-*.enc"))
+    except OSError:
+        return entries
+    for path in files:
+        try:
+            text = base64.b64decode(
+                path.read_text(encoding="utf-8").strip(), validate=True
+            ).decode("utf-8")
+        except Exception:
+            continue
+        if not looks_like_token(text):
+            continue
+        parts = path.name.split("-", 2)
+        try:
+            number = int(parts[1])
+        except (IndexError, ValueError):
+            continue
+        slug = parts[2][: -len(".enc")] if len(parts) > 2 else ""
+        entries.append(
+            {
+                "path": path,
+                "number": number,
+                "slug": slug,
+                "token": text,
+                "email": email_from_token(text, allow_network=False),
+                "expiry": token_expiry(text),
+            }
+        )
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Windows Credential Manager (advapi32 via ctypes -- no third-party package)
 # ---------------------------------------------------------------------------
@@ -643,8 +696,8 @@ def _file_candidates() -> list[tuple[str, Path]]:
     return found
 
 
-def read_token() -> tuple[Optional[str], str]:
-    """Return ``(token_json, source)`` choosing the freshest available copy.
+def _scored_candidates() -> list[tuple[tuple[float, float], str, str]]:
+    """Every readable token on this machine, freshest last.
 
     Freshness is judged by the token's own ``expiry`` claim first and file
     modification time second -- no wall-clock guessing about which store agy
@@ -667,11 +720,36 @@ def read_token() -> tuple[Optional[str], str]:
             mtime = 0.0
         scored.append(((token_expiry(text) or 0.0, mtime), text, str(path)))
 
+    scored.sort(key=lambda item: item[0])
+    return scored
+
+
+def read_token() -> tuple[Optional[str], str]:
+    """Return ``(token_json, source)`` choosing the freshest available copy."""
+    scored = _scored_candidates()
     if not scored:
         return None, "none"
-    scored.sort(key=lambda item: item[0])
     _, text, source = scored[-1]
     return text, source
+
+
+def live_tokens() -> list[tuple[str, str]]:
+    """Every *distinct* live token as ``(source, token_json)``, freshest last.
+
+    agy does not keep one credential store: Windows builds use Credential
+    Manager while the CLI also keeps a token file, and a machine logged in from
+    two contexts (a desktop session and an SSH session, say) can hold two
+    different accounts at once.  Identical payloads seen in two stores collapse
+    to the freshest entry, so a normally-synced machine reports one token.
+    """
+    seen: set[str] = set()
+    tokens: list[tuple[str, str]] = []
+    for _score, text, source in _scored_candidates():
+        if text in seen:
+            continue
+        seen.add(text)
+        tokens.append((source, text))
+    return tokens
 
 
 def write_token(content: str) -> list[str]:
@@ -702,38 +780,4 @@ def keyring_status() -> dict:
     return {"backend": backend, "available": available}
 
 
-def _token_email_offline(text: Optional[str]) -> Optional[str]:
-    return _jwt_claims(token_json(text).get("id_token")).get("email") or None
 
-
-def token_sources_disagree() -> Optional[str]:
-    """Describe a keyring/file mismatch, or ``None`` when they agree.
-
-    agy writes both stores, but not always in the same instant: a machine that
-    switched accounts can end up with the keyring holding one account and the
-    file another.  Switching through agy-swap rewrites both, which resyncs them.
-    """
-    ring = read_keyring()
-    if not ring:
-        return None
-    ring_email = _token_email_offline(ring)
-    if not ring_email:
-        return None
-
-    for path in paths.TOKEN_CANDIDATES:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if not looks_like_token(text):
-            continue
-        file_email = _token_email_offline(text)
-        if not file_email or file_email == ring_email:
-            continue
-        keyring_is_newer = (token_expiry(ring) or 0.0) >= (token_expiry(text) or 0.0)
-        winner = "keyring" if keyring_is_newer else path.name
-        return (
-            f"keyring holds {ring_email}, {path.name} holds {file_email}; "
-            f"using the newer one ({winner}) — 'agyswap switch' resyncs both"
-        )
-    return None

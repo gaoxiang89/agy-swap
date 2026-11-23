@@ -164,6 +164,28 @@ class AtomicWriteTest(unittest.TestCase):
         path.write_text("!!!not-base64!!!", encoding="utf-8")
         self.assertIsNone(credentials.read_token_backup(9, "bad@example.com"))
 
+    def test_scan_token_backups_decodes_and_skips_junk(self):
+        token = make_token("scan@example.com", expiry=time.time() + 60)
+        credentials.save_token_backup(3, "scan@example.com", token)
+        broken = paths.CREDENTIALS_DIR / ".creds-4-broken.enc"
+        broken.write_text("!!!not-base64!!!", encoding="utf-8")
+
+        entries = credentials.scan_token_backups()
+
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["number"], 3)
+        self.assertEqual(entry["slug"], "scan_at_example_dot_com")
+        self.assertEqual(entry["email"], "scan@example.com")
+        self.assertEqual(entry["token"], token)
+
+    def test_email_from_backup_slug(self):
+        self.assertEqual(
+            credentials.email_from_backup_slug("gaoxiang89ly_at_gmail_dot_com"),
+            "gaoxiang89ly@gmail.com",
+        )
+        self.assertIsNone(credentials.email_from_backup_slug("no-marker"))
+
 
 class TokenSelectionTest(unittest.TestCase):
     """Reading must pick the freshest token, not the first file it finds."""
@@ -221,6 +243,48 @@ class TokenSelectionTest(unittest.TestCase):
             token, source = credentials.read_token()
         self.assertIsNone(token)
         self.assertEqual(source, "none")
+
+    def test_live_tokens_lists_each_store_oldest_first(self):
+        from unittest import mock
+
+        primary = paths.GEMINI_DIR / "token"
+        legacy = paths.GEMINI_DIR / "legacy-token"
+        paths.GEMINI_DIR.mkdir(parents=True, exist_ok=True)
+        self._use_paths(primary, legacy)
+        legacy.write_text(
+            make_token("old@example.com", expiry=time.time() + 60), encoding="utf-8"
+        )
+        primary.write_text(
+            make_token("new@example.com", expiry=time.time() + 7200), encoding="utf-8"
+        )
+        ring = make_token("ring@example.com", expiry=time.time() + 3600)
+
+        with mock.patch.object(credentials, "read_keyring", return_value=ring):
+            tokens = credentials.live_tokens()
+
+        self.assertEqual(
+            [
+                credentials.email_from_token(text, allow_network=False)
+                for _source, text in tokens
+            ],
+            ["old@example.com", "ring@example.com", "new@example.com"],
+        )
+        self.assertTrue(tokens[1][0].startswith("keyring:"))
+
+    def test_live_tokens_collapses_identical_copies(self):
+        from unittest import mock
+
+        token = make_token("same@example.com", expiry=time.time() + 60)
+        primary = paths.GEMINI_DIR / "token"
+        paths.GEMINI_DIR.mkdir(parents=True, exist_ok=True)
+        self._use_paths(primary, paths.GEMINI_DIR / "absent")
+        primary.write_text(token, encoding="utf-8")
+
+        with mock.patch.object(credentials, "read_keyring", return_value=token):
+            tokens = credentials.live_tokens()
+
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0][1], token)
 
 
 if __name__ == "__main__":

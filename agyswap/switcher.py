@@ -197,12 +197,42 @@ class AgySwitcher:
     # -- mutations --------------------------------------------------------
 
     def add_current(self, email_override: Optional[str] = None) -> Account:
-        token = credentials.read_token()[0]
-        if not token:
+        """Capture the newest live login (see :meth:`add_sources`)."""
+        return self.add_sources(email_override=email_override)[-1][1]
+
+    def add_sources(
+        self, email_override: Optional[str] = None
+    ) -> list[tuple[str, Account]]:
+        """Capture every distinct agy login currently live on this machine.
+
+        agy keeps more than one credential store -- Credential Manager on
+        Windows, a token file for the CLI -- and a machine logged in from two
+        contexts (a desktop session and an SSH session, say) can hold two
+        *different* accounts at once.  Taking only the freshest token would
+        silently drop the other, so every distinct token is registered, oldest
+        first; when two sources carry the same account the newest backup wins.
+        """
+        tokens = credentials.live_tokens()
+        if not tokens:
             raise AgyError(
                 "No agy token found. Log in with agy first, then run 'agyswap add'."
             )
+        if email_override and len(tokens) > 1:
+            found = ", ".join(
+                f"{credentials.email_from_token(text) or 'unknown'} ({source})"
+                for source, text in tokens
+            )
+            raise AgyError(
+                f"Multiple live logins found: {found}. --email cannot say which "
+                f"one it names; run 'agyswap add' without --email, then "
+                f"'agyswap alias' to give them labels."
+            )
+        return [
+            (source, self._register_token(text, email_override))
+            for source, text in tokens
+        ]
 
+    def _register_token(self, token: str, email_override: Optional[str]) -> Account:
         verified = credentials.email_from_token(token)
 
         # The token's signed identity outranks a typed-in label.  Accepting a
@@ -246,6 +276,69 @@ class AgySwitcher:
         credentials.save_token_backup(number, email, token)
         self._save_sequence()
         return account
+
+    def orphan_backups(self) -> list[dict]:
+        """Backups on disk whose account is not in the registry, oldest first."""
+        known = {account.email.lower() for account in self._seq.accounts.values()}
+        orphaned: list[dict] = []
+        for entry in credentials.scan_token_backups():
+            email = self._backup_email(entry)
+            if email and email.lower() not in known:
+                orphaned.append(entry)
+        orphaned.sort(key=lambda entry: (entry["expiry"] or 0.0, entry["number"]))
+        return orphaned
+
+    def recover_accounts(self) -> list[Account]:
+        """Re-adopt backups whose registry entry was lost.
+
+        The account list lives in ``sequence.json`` while the tokens live in
+        ``~/.agy-swap/credentials``; losing the former used to mean losing the
+        list even though every token was still on disk.  Each backup whose
+        account is not registered is adopted again, keeping the slot number
+        encoded in its file name when that slot is still free.
+        """
+        recovered: list[Account] = []
+        touched = False
+        for entry in credentials.scan_token_backups():
+            email = self._backup_email(entry)
+            if not email:
+                continue
+            existing = self._find_account_by_email(email)
+            if existing:
+                # A stale copy of a managed account: only adopt it when it is
+                # actually newer than the backup already registered.
+                stored = credentials.read_token_backup(
+                    existing.number, existing.email
+                )
+                stored_expiry = credentials.token_expiry(stored) if stored else None
+                if entry["expiry"] and (
+                    stored_expiry is None or entry["expiry"] > stored_expiry
+                ):
+                    credentials.save_token_backup(
+                        existing.number, existing.email, entry["token"]
+                    )
+                    existing.updated_at = now_iso()
+                    touched = True
+                continue
+
+            number = entry["number"]
+            if number in self._seq.accounts:
+                number = self._next_number()
+            account = Account(number=number, email=email)
+            self._seq.accounts[number] = account
+            self._seq.sequence.append(number)
+            credentials.save_token_backup(number, email, entry["token"])
+            recovered.append(account)
+            touched = True
+
+        if touched:
+            self._seq.sequence.sort()
+            self._save_sequence()
+        return recovered
+
+    @staticmethod
+    def _backup_email(entry: dict) -> Optional[str]:
+        return entry["email"] or credentials.email_from_backup_slug(entry["slug"])
 
     def remove_account(self, identifier: str) -> Account:
         account = self._resolve_account(identifier)

@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 from unittest import mock
 
@@ -95,6 +96,103 @@ class AddTest(SwitcherTestCase):
         switcher = AgySwitcher()
         account = switcher.add_current(email_override="work@example.com")
         self.assertEqual(account.email, "work@example.com")
+
+
+class AddMultipleSourcesTest(SwitcherTestCase):
+    """A machine can hold two different accounts in two different stores."""
+
+    def test_add_captures_keyring_login_next_to_file_login(self):
+        self.set_live_token("file@example.com")
+        ring = make_token("ring@example.com", expiry=time.time() + 7200)
+
+        with mock.patch.object(credentials, "read_keyring", return_value=ring):
+            captured = AgySwitcher().add_sources()
+
+        self.assertEqual(
+            [account.email for _source, account in captured],
+            ["file@example.com", "ring@example.com"],
+        )
+        self.assertEqual([account.number for _source, account in captured], [1, 2])
+        self.assertIsNotNone(
+            credentials.read_token_backup(2, "ring@example.com")
+        )
+
+    def test_identical_token_in_both_stores_is_one_account(self):
+        token = self.set_live_token("same@example.com", expiry=time.time() + 600)
+
+        with mock.patch.object(credentials, "read_keyring", return_value=token):
+            captured = AgySwitcher().add_sources()
+
+        self.assertEqual([a.email for _source, a in captured], ["same@example.com"])
+        self.assertEqual(len(AgySwitcher().list_accounts()), 1)
+
+    def test_email_override_rejected_when_several_logins_are_live(self):
+        self.set_live_token("file@example.com")
+        ring = make_token("ring@example.com", expiry=time.time() + 7200)
+
+        with mock.patch.object(credentials, "read_keyring", return_value=ring):
+            with self.assertRaises(AgyError):
+                AgySwitcher().add_sources(email_override="work@example.com")
+
+        self.assertEqual(AgySwitcher().list_accounts(), [])
+
+
+class RecoverTest(SwitcherTestCase):
+    """A lost registry must not mean lost accounts: backups can re-adopt."""
+
+    def test_recover_adopts_orphaned_backups(self):
+        credentials.save_token_backup(4, "old@example.com", make_token("old@example.com"))
+        credentials.save_token_backup(1, "new@example.com", make_token("new@example.com"))
+
+        recovered = AgySwitcher().recover_accounts()
+
+        self.assertEqual(
+            [account.email for account in recovered],
+            ["new@example.com", "old@example.com"],
+        )
+        self.assertEqual([account.number for account in recovered], [1, 4])
+        self.assertEqual(
+            [row["email"] for row in AgySwitcher().list_accounts()],
+            ["new@example.com", "old@example.com"],
+        )
+
+    def test_recover_skips_registered_accounts(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        credentials.save_token_backup(
+            1, "alice@example.com", make_token("alice@example.com")
+        )
+        credentials.save_token_backup(7, "bob@example.com", make_token("bob@example.com"))
+
+        recovered = switcher.recover_accounts()
+
+        self.assertEqual([a.email for a in recovered], ["bob@example.com"])
+        self.assertEqual(switcher.orphan_backups(), [])
+
+    def test_recover_avoids_a_taken_slot_number(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        credentials.save_token_backup(1, "bob@example.com", make_token("bob@example.com"))
+
+        recovered = switcher.recover_accounts()
+
+        self.assertEqual([a.number for a in recovered], [2])
+
+    def test_recover_takes_newer_orphan_copy_of_managed_account(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        fresher = make_token("alice@example.com", expiry=time.time() + 7200)
+        credentials.save_token_backup(9, "alice@example.com", fresher)
+
+        recovered = switcher.recover_accounts()
+
+        self.assertEqual(recovered, [])
+        self.assertEqual(
+            credentials.read_token_backup(1, "alice@example.com"), fresher
+        )
 
 
 class ListAndStatusTest(SwitcherTestCase):

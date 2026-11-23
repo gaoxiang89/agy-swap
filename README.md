@@ -75,17 +75,29 @@ not silently swap in the PyPI release.
 
 ```bash
 agyswap doctor               # what agy-swap can see: keyring, token, identity
-agyswap add                  # capture the account agy is currently logged in as
+agyswap add                  # capture every live agy login as accounts
 agyswap statusline --setup   # enable live quota (see "Quota data")
 agyswap                      # open the dashboard
 ```
 
 To add another account, log into it with `agy`, then run `agyswap add` again.
 
+`agyswap add` registers **every** live login it can see, not just the newest
+one. An agy install can hold two different accounts at once — for example a
+desktop login in Credential Manager next to an SSH login in the token file —
+and both are captured in a single run; the output names the store each account
+came from. Duplicate copies of the same token collapse into one account.
+
+Backups outlive the registry: if `~/.agy-swap/sequence.json` is lost or reset,
+`agyswap recover` re-registers every account whose token is still in
+`~/.agy-swap/credentials/`, keeping the old slot number where it is free.
+`agyswap doctor` reports any unregistered backups it finds.
+
 ## Usage
 
 ```bash
-agyswap add                    # capture the current agy login as an account
+agyswap add                    # capture the live agy login(s) as accounts
+agyswap recover               # re-adopt accounts from orphaned token backups
 agyswap list                   # list accounts, tokens and quota
 agyswap switch                 # rotate to the next enabled account
 agyswap switch 2               # by slot number
@@ -216,19 +228,19 @@ account its usage stays visible after you switch away.
 - Switching rewrites the live token in **every** store agy might read: the OS
   keyring and the token file(s), so the two can never drift apart
 - Account identity is read from the token itself — the signed `id_token` JWT in
-  the file, or the `id_token_email` field agy writes to the Credential Manager —
-  so it is correct offline and does not depend on any bookkeeping file agy may
-  drop
+  the file, the `id_token_email` field some agy builds write to the Credential
+  Manager, or Google's `userinfo` endpoint when a store keeps neither — so it
+  does not depend on any bookkeeping file agy may drop
 - Rejects a switch whose stored token belongs to a different account than the
   slot claims (prevents silently swapping in the wrong login)
 
-agy names its token file per platform rather than per version, so agy-swap
-probes both locations and uses whichever holds the fresher token:
+agy has kept its token in more than one file location across builds, so
+agy-swap probes both and uses whichever holds the fresher token:
 
 | Data | Path |
 |---|---|
-| Active token (Windows) | `~/.gemini/jetski-standalone-oauth-token` |
-| Active token (Linux, and some older builds) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| Active token (either location) | `~/.gemini/jetski-standalone-oauth-token` |
+| Active token (either location) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
 | Legacy account pointer | `~/.gemini/google_accounts.json` (only `active` is touched) |
 | Credential backups | `~/.agy-swap/credentials/` |
 | Account registry | `~/.agy-swap/sequence.json` |

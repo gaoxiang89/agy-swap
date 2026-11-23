@@ -139,8 +139,11 @@ class AgySwapApp(App):
 
     def do_add_current(self) -> None:
         def action() -> str:
-            account = self._sw.add_current()
-            return f"Added #{account.number} {account.email}"
+            captured = self._sw.add_sources()
+            added = ", ".join(
+                f"#{account.number} {account.email}" for _source, account in captured
+            )
+            return f"Added {added}"
 
         self._run_action(action)
 
