@@ -14,6 +14,11 @@ class Account:
     alias: Optional[str] = None
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+    backup_number: Optional[int] = None
+
+    @property
+    def credential_number(self) -> int:
+        return self.number if self.backup_number is None else self.backup_number
 
 
 @dataclass
@@ -35,6 +40,8 @@ class SequenceData:
                     "alias": acc.alias,
                     "createdAt": acc.created_at,
                     "updatedAt": acc.updated_at,
+                    **({"backupNumber": acc.credential_number}
+                       if acc.credential_number != num else {}),
                 }
                 for num, acc in self.accounts.items()
             },
@@ -52,6 +59,7 @@ class SequenceData:
                 alias=acc_data.get("alias"),
                 created_at=acc_data.get("createdAt", ""),
                 updated_at=acc_data.get("updatedAt", ""),
+                backup_number=acc_data.get("backupNumber"),
             )
         return cls(
             active_email=data.get("activeEmail"),

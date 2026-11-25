@@ -64,7 +64,7 @@ class WatchScreen(AccountListScreen):
             return
         item = event.item
         if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
+            self.app.do_switch(item.email)
             self._set_selecting(False)
 
     def action_select_highlighted(self) -> None:

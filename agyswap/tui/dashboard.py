@@ -90,7 +90,7 @@ class DashboardScreen(Screen):
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
         entries: MenuEntries = [
-            (f"{r['number']}  {r['email']}", f"remove:{r['number']}")
+            (f"{r['number']}  {r['email']}", f"remove:{r['email']}")
             for r in (snap or ())
         ]
         entries.append(_BACK)
@@ -106,7 +106,7 @@ class DashboardScreen(Screen):
             action = "→ enable" if r.get("disabled") else "→ disable"
             state = "  (disabled)" if r.get("disabled") else ""
             entries.append(
-                (f"{r['number']}  {name}{state}   {action}", f"disable:{r['number']}")
+                (f"{r['number']}  {name}{state}   {action}", f"disable:{r['email']}")
             )
         entries.append(_BACK)
         return entries
@@ -153,12 +153,12 @@ class DashboardScreen(Screen):
         elif action_id == "remove-menu":
             await self._push_menu("remove account", self._remove_entries())
         elif action_id.startswith("remove:"):
-            number = action_id.split(":", 1)[1]
-            self.app.do_remove(number)
+            email = action_id.split(":", 1)[1]
+            self.app.do_remove(email)
             await self._pop_menu()
         elif action_id.startswith("disable:"):
-            number = action_id.split(":", 1)[1]
-            self.app.do_toggle_disabled(number)
+            email = action_id.split(":", 1)[1]
+            self.app.do_toggle_disabled(email)
             await self._pop_menu()
         else:
             actions[action_id]()
@@ -272,7 +272,7 @@ class SwitchScreen(AccountListScreen):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
+            self.app.do_switch(item.email)
             self.app.pop_screen()
 
     def action_select_highlighted(self) -> None:

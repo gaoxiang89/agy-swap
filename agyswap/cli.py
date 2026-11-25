@@ -136,11 +136,24 @@ def cmd_recover(sw: AgySwitcher, args) -> None:
 
 def cmd_remove(sw: AgySwitcher, args) -> None:
     try:
-        account = sw.remove_account(args.identifier)
-    except AccountNotFoundError as exc:
+        accounts = sw.remove_accounts(args.identifiers)
+    except (AgyError, OSError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
-    console.print(f"[red]Removed[/red] account #{account.number}: {account.email}")
+    for account in accounts:
+        console.print(f"[red]Removed[/red] account #{account.number}: {account.email}")
+
+
+def cmd_renumber(sw: AgySwitcher, args) -> None:
+    try:
+        changed = sw.renumber()
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    if changed:
+        console.print(f"[green]Renumbered[/green] {changed} account(s).")
+    else:
+        console.print("Account numbers are already consecutive.")
 
 
 def cmd_switch(sw: AgySwitcher, args) -> None:
@@ -388,7 +401,8 @@ def main() -> None:
   agyswap switch email     switch to account by email
   agyswap disable 2        hold an account out of rotation
   agyswap enable 2         return an account to rotation
-  agyswap remove 2         remove an account
+  agyswap remove 1 2       remove accounts and close gaps
+  agyswap renumber         close gaps in existing account numbers
   agyswap alias 2 work     set an alias
   agyswap alias 2 --unset  remove an alias
   agyswap tui              interactive dashboard
@@ -413,8 +427,9 @@ def main() -> None:
     p_switch = sub.add_parser("switch", help="switch accounts")
     p_switch.add_argument("identifier", nargs="?", help="account number, email, or alias")
 
-    p_remove = sub.add_parser("remove", aliases=["rm"], help="remove an account")
-    p_remove.add_argument("identifier", help="account number, email, or alias")
+    p_remove = sub.add_parser("remove", aliases=["rm"], help="remove accounts and close gaps")
+    p_remove.add_argument("identifiers", nargs="+", help="account numbers, emails, or aliases")
+    sub.add_parser("renumber", help="close gaps in existing account numbers")
 
     p_disable = sub.add_parser("disable", help="hold account out of rotation")
     p_disable.add_argument("identifier", help="account number, email, or alias")
@@ -455,6 +470,7 @@ def main() -> None:
         "switch": cmd_switch,
         "remove": cmd_remove,
         "rm": cmd_remove,
+        "renumber": cmd_renumber,
         "disable": cmd_disable,
         "enable": cmd_enable,
         "alias": cmd_alias,

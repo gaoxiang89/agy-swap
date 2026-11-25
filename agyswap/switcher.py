@@ -8,6 +8,9 @@ macOS (Keychain), Windows (Credential Manager) and Linux (Secret Service).
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import replace
+from functools import wraps
 from typing import Optional
 
 from agyswap import credentials, paths, quota
@@ -20,6 +23,27 @@ class AgyError(Exception):
 
 class AccountNotFoundError(AgyError):
     pass
+
+
+def _registry_mutation(method):
+    @wraps(method)
+    def update(self, *args, **kwargs):
+        lock_path = paths.BACKUP_ROOT / ".sequence.lock"
+        with lock_path.open("a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            # Closing the handle releases the lock on either platform.
+            self.reload()
+            return method(self, *args, **kwargs)
+
+    return update
 
 
 def _read_json(path) -> Optional[dict]:
@@ -156,11 +180,12 @@ class AgySwitcher:
     # -- queries ----------------------------------------------------------
 
     def list_accounts(self) -> list[dict]:
+        seq = self._load_sequence()
         active_email = current_email()
         cache = quota.load_cache()
         rows: list[dict] = []
-        for number in self._seq.sequence:
-            account = self._seq.accounts.get(number)
+        for number in seq.sequence:
+            account = seq.accounts.get(number)
             if not account:
                 continue
             details = quota.describe(account.email, cache)
@@ -173,8 +198,9 @@ class AgySwitcher:
                     "active": bool(
                         active_email and account.email.lower() == active_email.lower()
                     ),
-                    "has_token": credentials.read_token_backup(number, account.email)
-                    is not None,
+                    "has_token": credentials.read_token_backup(
+                        account.credential_number, account.email
+                    ) is not None,
                     "quota_windows": details["windows"],
                     "quota_status": details["status"],
                     "quota_detail": details["detail"],
@@ -200,6 +226,7 @@ class AgySwitcher:
         """Capture the newest live login (see :meth:`add_sources`)."""
         return self.add_sources(email_override=email_override)[-1][1]
 
+    @_registry_mutation
     def add_sources(
         self, email_override: Optional[str] = None
     ) -> list[tuple[str, Account]]:
@@ -263,17 +290,21 @@ class AgySwitcher:
             # Only overwrite when the token's identity is confirmed, so a
             # half-finished login can never corrupt a good backup.
             if verified and existing.email.lower() == verified.lower():
-                credentials.save_token_backup(existing.number, existing.email, token)
+                credentials.save_token_backup(existing.credential_number, existing.email, token)
                 existing.updated_at = now_iso()
                 self._save_sequence()
             return existing
 
         number = self._next_number()
-        account = Account(number=number, email=email)
+        last_backup = max(
+            (account.credential_number for account in self._seq.accounts.values()),
+            default=0,
+        )
+        account = Account(number=number, email=email, backup_number=max(number, last_backup + 1))
         self._seq.accounts[number] = account
         if number not in self._seq.sequence:
             self._seq.sequence.append(number)
-        credentials.save_token_backup(number, email, token)
+        credentials.save_token_backup(account.credential_number, email, token)
         self._save_sequence()
         return account
 
@@ -288,6 +319,7 @@ class AgySwitcher:
         orphaned.sort(key=lambda entry: (entry["expiry"] or 0.0, entry["number"]))
         return orphaned
 
+    @_registry_mutation
     def recover_accounts(self) -> list[Account]:
         """Re-adopt backups whose registry entry was lost.
 
@@ -308,14 +340,14 @@ class AgySwitcher:
                 # A stale copy of a managed account: only adopt it when it is
                 # actually newer than the backup already registered.
                 stored = credentials.read_token_backup(
-                    existing.number, existing.email
+                    existing.credential_number, existing.email
                 )
                 stored_expiry = credentials.token_expiry(stored) if stored else None
                 if entry["expiry"] and (
                     stored_expiry is None or entry["expiry"] > stored_expiry
                 ):
                     credentials.save_token_backup(
-                        existing.number, existing.email, entry["token"]
+                        existing.credential_number, existing.email, entry["token"]
                     )
                     existing.updated_at = now_iso()
                     touched = True
@@ -324,10 +356,10 @@ class AgySwitcher:
             number = entry["number"]
             if number in self._seq.accounts:
                 number = self._next_number()
-            account = Account(number=number, email=email)
+            account = Account(number=number, email=email, backup_number=entry["number"])
             self._seq.accounts[number] = account
             self._seq.sequence.append(number)
-            credentials.save_token_backup(number, email, entry["token"])
+            credentials.save_token_backup(account.credential_number, email, entry["token"])
             recovered.append(account)
             touched = True
 
@@ -341,14 +373,45 @@ class AgySwitcher:
         return entry["email"] or credentials.email_from_backup_slug(entry["slug"])
 
     def remove_account(self, identifier: str) -> Account:
-        account = self._resolve_account(identifier)
-        credentials.delete_token_backup(account.number, account.email)
-        self._seq.accounts.pop(account.number, None)
-        if account.number in self._seq.sequence:
-            self._seq.sequence.remove(account.number)
-        self._save_sequence()
-        return account
+        return self.remove_accounts([identifier])[0]
 
+    @_registry_mutation
+    def remove_accounts(self, identifiers: list[str]) -> list[Account]:
+        removed = {}
+        for identifier in identifiers:
+            account = self._resolve_account(identifier)
+            removed[account.number] = account
+        self._renumber(exclude=set(removed))
+        for account in removed.values():
+            credentials.delete_token_backup(account.credential_number, account.email)
+        return list(removed.values())
+
+    @_registry_mutation
+    def renumber(self) -> int:
+        return self._renumber(exclude=set())
+
+    def _renumber(self, *, exclude: set[int]) -> int:
+        ordered = dict.fromkeys([*self._seq.sequence, *self._seq.accounts])
+        remaining = [
+            self._seq.accounts[number] for number in ordered
+            if number in self._seq.accounts and number not in exclude
+        ]
+        accounts = {
+            number: replace(account, number=number, backup_number=account.credential_number)
+            for number, account in enumerate(remaining, start=1)
+        }
+        changed = sum(account.number != number for number, account in enumerate(remaining, 1))
+        if exclude or list(accounts) != self._seq.sequence or changed:
+            previous = self._seq
+            self._seq = replace(previous, accounts=accounts, sequence=list(accounts))
+            try:
+                self._save_sequence()
+            except OSError:
+                self._seq = previous
+                raise
+        return changed
+
+    @_registry_mutation
     def set_disabled(self, identifier: str, disabled: bool) -> Account:
         account = self._resolve_account(identifier)
         account.disabled = disabled
@@ -356,6 +419,7 @@ class AgySwitcher:
         self._save_sequence()
         return account
 
+    @_registry_mutation
     def switch(self, identifier: Optional[str] = None) -> dict:
         if identifier is None:
             return self._rotate()
@@ -381,7 +445,7 @@ class AgySwitcher:
         return self._activate(target)
 
     def _activate(self, target: Account) -> dict:
-        token = credentials.read_token_backup(target.number, target.email)
+        token = credentials.read_token_backup(target.credential_number, target.email)
         if not token:
             raise AgyError(
                 f"No stored token for {target.email}. "
@@ -402,7 +466,7 @@ class AgySwitcher:
             owner = self._find_account_by_email(live_email) if live_email else None
             if owner:
                 # Capture any refresh agy performed while this account was active.
-                credentials.save_token_backup(owner.number, owner.email, live)
+                credentials.save_token_backup(owner.credential_number, owner.email, live)
 
         written = credentials.write_token(token)
         _write_google_accounts(target.email)
@@ -417,6 +481,7 @@ class AgySwitcher:
 
     # -- aliases ----------------------------------------------------------
 
+    @_registry_mutation
     def alias(self, identifier: str, alias: Optional[str] = None) -> Account:
         account = self._resolve_account(identifier)
         if alias is None:
@@ -426,6 +491,7 @@ class AgySwitcher:
         self._save_sequence()
         return account
 
+    @_registry_mutation
     def unalias(self, identifier: str) -> Account:
         account = self._resolve_account(identifier)
         account.alias = None

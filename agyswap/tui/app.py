@@ -107,32 +107,32 @@ class AgySwapApp(App):
             self.notify(message, severity=severity, timeout=4)
         self.request_refresh()
 
-    def do_switch(self, number) -> None:
+    def do_switch(self, email: str) -> None:
         def action() -> str:
-            result = self._sw.switch(str(number))
+            result = self._sw.switch(email)
             return f"Activated {result['active']} (new agy sessions only)"
 
         self._run_action(action)
 
-    def do_toggle_disabled(self, number) -> None:
+    def do_toggle_disabled(self, email: str) -> None:
         snapshot = self.snapshot or []
         target_state = None
         for row in snapshot:
-            if str(row["number"]) == str(number):
+            if row["email"] == email:
                 target_state = not row.get("disabled", False)
                 break
         if target_state is None:
             return
 
         def action() -> str:
-            account = self._sw.set_disabled(str(number), target_state)
+            account = self._sw.set_disabled(email, target_state)
             return f"{'Disabled' if target_state else 'Enabled'} #{account.number}"
 
         self._run_action(action)
 
-    def do_remove(self, number) -> None:
+    def do_remove(self, email: str) -> None:
         def action() -> str:
-            account = self._sw.remove_account(str(number))
+            account = self._sw.remove_account(email)
             return f"Removed #{account.number} {account.email}"
 
         self._run_action(action)

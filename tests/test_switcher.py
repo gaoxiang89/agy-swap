@@ -333,6 +333,48 @@ class RemoveTest(SwitcherTestCase):
         self.assertEqual(switcher.list_accounts(), [])
         self.assertIsNone(credentials.read_token_backup(1, "alice@example.com"))
 
+    def test_batch_remove_closes_gaps_and_preserves_switchable_backups(self):
+        switcher = AgySwitcher()
+        for name in ("alice", "bob", "carol", "dave"):
+            self.set_live_token(f"{name}@example.com")
+            switcher.add_current()
+        switcher.alias("3", "work")
+        switcher.set_disabled("4", True)
+
+        removed = switcher.remove_accounts(["1", "2"])
+        self.assertEqual([account.number for account in removed], [1, 2])
+        switcher = AgySwitcher()
+        self.assertEqual(
+            [(r["number"], r["alias"], r["disabled"], r["has_token"])
+             for r in switcher.list_accounts()],
+            [(1, "work", False, True), (2, None, True, True)],
+        )
+        self.assertEqual(switcher.switch("1")["active"], "carol@example.com")
+        self.assertEqual(switcher.switch("2")["active"], "dave@example.com")
+
+        self.set_live_token("eve@example.com")
+        self.assertEqual(switcher.add_current().number, 3)
+        switcher.remove_account("1")
+        self.assertIsNone(credentials.read_token_backup(3, "carol@example.com"))
+        self.assertEqual(switcher.switch("2")["active"], "eve@example.com")
+
+    def test_invalid_batch_keeps_all_accounts(self):
+        switcher = AgySwitcher()
+        self.set_live_token("alice@example.com")
+        switcher.add_current()
+        with self.assertRaises(AgyError):
+            switcher.remove_accounts(["1", "2"])
+        self.assertTrue(AgySwitcher().list_accounts()[0]["has_token"])
+
+    def test_renumber_updates_a_legacy_registry_with_gaps(self):
+        credentials.save_token_backup(4, "alice@example.com", make_token("alice@example.com"))
+        switcher = AgySwitcher()
+        switcher.recover_accounts()
+        self.assertEqual(AgySwitcher().renumber(), 1)
+        switcher = AgySwitcher()
+        self.assertEqual(switcher.switch("1")["active"], "alice@example.com")
+        self.assertEqual(switcher.renumber(), 0)
+
 
 class LegacyIdentityTest(SwitcherTestCase):
     def test_falls_back_to_google_accounts(self):

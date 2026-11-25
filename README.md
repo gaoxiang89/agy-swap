@@ -108,10 +108,13 @@ agyswap enable 2
 agyswap alias 2 work
 agyswap alias 2 --unset
 agyswap remove 2
+agyswap remove 1 2             # remove both slots as numbered before the command
+agyswap renumber               # close gaps left by older versions
 agyswap doctor                 # what agy-swap can see on this machine
 ```
 
 Run `agyswap` with no arguments for the interactive dashboard.
+Removing accounts closes gaps in the remaining slot numbers while preserving rotation order.
 
 ### Dashboard
 
