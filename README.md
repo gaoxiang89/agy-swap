@@ -64,12 +64,26 @@ uv tool update-shell
 ### Update
 
 ```bash
-uv tool upgrade agy-swap     # re-resolves from the recorded git source
-pipx upgrade agy-swap
+agyswap upgrade              # alias: agyswap update
+agyswap upgrade --dry-run    # print the commands without running them
 ```
 
-`uv tool upgrade` follows whatever source the tool was installed from — it will
-not silently swap in the PyPI release.
+`agyswap upgrade` works out how it was installed and runs that tool:
+
+| Installed with | What runs |
+|---|---|
+| `uv tool install` | `uv tool upgrade agy-swap` |
+| `pipx install` | `pipx upgrade agy-swap` |
+| `--editable` from a clone | `git pull --ff-only` in the clone, then the uv/pipx step |
+
+Both re-resolve from the recorded git source, so they never swap in the
+macOS-only PyPI release. An install pinned to a tag or commit stays on it;
+re-run the install command with a newer revision, or without one, to move on.
+
+On Windows a running `agyswap.exe` cannot be replaced, so the upgrade finishes
+in the same window right after `agyswap` exits. If it reports that a file is in
+use, close any other agyswap (a dashboard, or agy's status line) and run
+`uv tool upgrade --reinstall agy-swap`.
 
 ## First run
 

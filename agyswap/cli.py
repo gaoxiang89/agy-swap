@@ -463,6 +463,68 @@ def cmd_statusline(sw, args) -> None:
     sys.exit(statusline_main(argv))
 
 
+def cmd_upgrade(sw, args) -> None:
+    from agyswap import upgrade
+
+    install = upgrade.detect()
+    try:
+        steps = upgrade.plan(install)
+    except upgrade.UpgradeError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    console.print(f"Installed: [bold]{install.revision}[/bold] [dim]via {install.label}[/dim]")
+    if install.pinned and install.editable is None:
+        console.print(
+            f"[yellow]Pinned to '{install.pinned}'[/yellow], so upgrades stay there. "
+            "Re-run the install command with a newer revision, or without one, to move on."
+        )
+    if not steps:
+        console.print(
+            "[yellow]Cannot tell how agy-swap was installed, so it cannot upgrade "
+            "itself.[/yellow] Reinstall with one of:\n"
+        )
+        console.print(
+            f'  uv tool install --reinstall --from "git+{upgrade.REPO_URL}" agy-swap\n'
+            f'  pipx install --force "git+{upgrade.REPO_URL}"',
+            markup=False, highlight=False, soft_wrap=True,
+        )
+        sys.exit(1)
+
+    for step in steps:
+        console.print(f"$ {upgrade.display(step)}", style="dim", markup=False,
+                      highlight=False, soft_wrap=True)
+        if args.dry_run:
+            continue
+        try:
+            if upgrade.must_hand_off(step):
+                upgrade.hand_off(step)
+                console.print(
+                    "[dim]Windows cannot replace agyswap.exe while it is running, so "
+                    "the upgrade finishes in this window right after agyswap exits.[/dim]"
+                )
+                return
+            code = upgrade.run(step)
+        except upgrade.UpgradeError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            sys.exit(1)
+        if code:
+            console.print(f"[red]Upgrade failed[/red] (exit {code}).")
+            if step.retry_hint:
+                console.print(step.retry_hint, markup=False, highlight=False)
+            sys.exit(code)
+    if args.dry_run:
+        return
+
+    after = upgrade.detect(install.prefix)
+    if after.revision == install.revision:
+        console.print(f"[green]Already up to date:[/green] {after.revision}")
+    else:
+        console.print(
+            f"[green]Upgraded:[/green] {install.revision} → [bold]{after.revision}[/bold]"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agyswap",
@@ -486,6 +548,7 @@ def main() -> None:
   agyswap tui              interactive dashboard
   agyswap watch            dashboard on the watch page
   agyswap doctor           show what agy-swap can see on this machine
+  agyswap upgrade          upgrade agy-swap with the tool that installed it
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -541,6 +604,11 @@ def main() -> None:
                               help="write the agy-statusline launcher script")
     p_statusline.add_argument("--chain", help="also run this command, forwarding its output")
 
+    p_upgrade = sub.add_parser("upgrade", aliases=["update"],
+                               help="upgrade agy-swap with the tool that installed it")
+    p_upgrade.add_argument("--dry-run", action="store_true",
+                           help="print the commands without running them")
+
     args = parser.parse_args()
 
     switcher = AgySwitcher()
@@ -566,6 +634,8 @@ def main() -> None:
         "watch": cmd_tui,
         "doctor": cmd_doctor,
         "statusline": cmd_statusline,
+        "upgrade": cmd_upgrade,
+        "update": cmd_upgrade,
     }
 
     handler = dispatch.get(args.command)
