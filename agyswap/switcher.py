@@ -162,6 +162,31 @@ class AgySwitcher:
     def _find_account_by_number(self, number: int) -> Optional[Account]:
         return self._seq.accounts.get(number)
 
+    def _active_account(self) -> Optional[Account]:
+        """The account ``sync`` falls back to when no live token exists."""
+        if self._seq.active_email:
+            account = self._find_account_by_email(self._seq.active_email)
+            if account and not account.disabled:
+                return account
+        for number in self._seq.sequence:
+            account = self._seq.accounts.get(number)
+            if account and not account.disabled:
+                return account
+        return None
+
+    def _save_backup_if_fresher(self, owner: Account, content: str) -> None:
+        """Persist ``content`` to ``owner``'s backup without clobbering a newer copy."""
+        existing = credentials.read_token_backup(owner.credential_number, owner.email)
+        if existing:
+            cand_exp = credentials.token_expiry(content)
+            exist_exp = credentials.token_expiry(existing)
+            if exist_exp is not None and (cand_exp is None or cand_exp < exist_exp):
+                return
+        try:
+            credentials.save_token_backup(owner.credential_number, owner.email, content)
+        except OSError:
+            pass
+
     def _resolve_account(self, identifier: str) -> Account:
         try:
             account = self._find_account_by_number(int(identifier))
@@ -218,6 +243,95 @@ class AgySwitcher:
             "active": active_email,
             "managed": account is not None,
             "number": account.number if account else None,
+        }
+
+    def sync(self, *, if_missing: bool = False) -> dict:
+        """Restore the active token into agy's file store.
+
+        agy skips the OS keyring whenever it detects an SSH session and reads
+        ``~/.gemini/antigravity-cli/antigravity-oauth-token`` instead.  On a
+        Windows SSH logon the keyring is unreachable at the OS level as well,
+        so that file is the only way in.
+
+        The token is the freshest one agy-swap can see -- the keyring or a token
+        file on a desktop, agy-swap's mirror or the active account's backup over
+        SSH.  ``if_missing`` makes the call safe to run before every agy start:
+        an existing file is left alone, so a token agy refreshed itself is never
+        replaced with an older copy.
+        """
+        target = paths.SSH_TOKEN_PATH
+        if if_missing and credentials.has_wrapped_token(target):
+            return {
+                "status": "present",
+                "source": None,
+                "email": None,
+                "path": str(target),
+                "targets": [],
+            }
+        return self._sync_locked(target)
+
+    @_registry_mutation
+    def _sync_locked(self, target) -> dict:
+        scored: list[tuple[tuple[float, int], str, str]] = []
+
+        live, live_source = credentials.read_token()
+        if live:
+            scored.append(
+                ((credentials.token_expiry(live) or 0.0, 3), live, live_source)
+            )
+
+        mirror = credentials.read_token_mirror()
+        if mirror:
+            scored.append(
+                (
+                    (credentials.token_expiry(mirror) or 0.0, 2),
+                    mirror,
+                    str(paths.SSH_TOKEN_MIRROR),
+                )
+            )
+
+        account = self._active_account()
+        if account:
+            backup = credentials.read_token_backup(
+                account.credential_number, account.email
+            )
+            if backup:
+                scored.append(
+                    (
+                        (credentials.token_expiry(backup) or 0.0, 1),
+                        backup,
+                        f"backup:{account.email}",
+                    )
+                )
+
+        if not scored:
+            raise AgyError(
+                "No token available to sync. Log in with agy on a desktop "
+                "session, run 'agyswap add' there, then run 'agyswap sync'."
+            )
+
+        scored.sort(key=lambda item: item[0])
+        _, content, source = scored[-1]
+
+        email = credentials.email_from_token(content, allow_network=False)
+        if email:
+            _write_google_accounts(email)
+            owner = self._find_account_by_email(email)
+            if owner:
+                # Capture a refresh agy performed while this account was active,
+                # without overwriting a fresher backup saved earlier.
+                self._save_backup_if_fresher(owner, content)
+                if self._seq.active_email != owner.email:
+                    self._seq.active_email = owner.email
+                    self._save_sequence()
+
+        written = credentials.write_token(content)
+        return {
+            "status": "synced",
+            "source": source,
+            "email": email,
+            "path": str(target),
+            "targets": written,
         }
 
     # -- mutations --------------------------------------------------------
@@ -290,9 +404,12 @@ class AgySwitcher:
             # Only overwrite when the token's identity is confirmed, so a
             # half-finished login can never corrupt a good backup.
             if verified and existing.email.lower() == verified.lower():
-                credentials.save_token_backup(existing.credential_number, existing.email, token)
+                self._save_backup_if_fresher(existing, token)
                 existing.updated_at = now_iso()
+                self._seq.active_email = existing.email
                 self._save_sequence()
+                if paths.SSH_TOKEN_MIRROR.exists():
+                    credentials.write_token_mirror(token)
             return existing
 
         number = self._next_number()
@@ -305,7 +422,10 @@ class AgySwitcher:
         if number not in self._seq.sequence:
             self._seq.sequence.append(number)
         credentials.save_token_backup(account.credential_number, email, token)
+        self._seq.active_email = account.email
         self._save_sequence()
+        if paths.SSH_TOKEN_MIRROR.exists():
+            credentials.write_token_mirror(token)
         return account
 
     def orphan_backups(self) -> list[dict]:
@@ -382,8 +502,14 @@ class AgySwitcher:
             account = self._resolve_account(identifier)
             removed[account.number] = account
         self._renumber(exclude=set(removed))
+        removed_emails = {account.email.lower() for account in removed.values()}
         for account in removed.values():
             credentials.delete_token_backup(account.credential_number, account.email)
+        mirror = credentials.read_token_mirror()
+        if mirror:
+            mirror_email = credentials.email_from_token(mirror, allow_network=False)
+            if mirror_email and mirror_email.lower() in removed_emails:
+                credentials.delete_token_mirror()
         return list(removed.values())
 
     @_registry_mutation
@@ -403,7 +529,22 @@ class AgySwitcher:
         changed = sum(account.number != number for number, account in enumerate(remaining, 1))
         if exclude or list(accounts) != self._seq.sequence or changed:
             previous = self._seq
-            self._seq = replace(previous, accounts=accounts, sequence=list(accounts))
+            removed_emails = {
+                previous.accounts[n].email.lower()
+                for n in exclude
+                if n in previous.accounts
+            }
+            active_email = (
+                None
+                if previous.active_email and previous.active_email.lower() in removed_emails
+                else previous.active_email
+            )
+            self._seq = replace(
+                previous,
+                active_email=active_email,
+                accounts=accounts,
+                sequence=list(accounts),
+            )
             try:
                 self._save_sequence()
             except OSError:
@@ -466,7 +607,7 @@ class AgySwitcher:
             owner = self._find_account_by_email(live_email) if live_email else None
             if owner:
                 # Capture any refresh agy performed while this account was active.
-                credentials.save_token_backup(owner.credential_number, owner.email, live)
+                self._save_backup_if_fresher(owner, live)
 
         written = credentials.write_token(token)
         _write_google_accounts(target.email)

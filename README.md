@@ -5,8 +5,8 @@ Switch between Google/Gemini accounts without logging out, and watch every
 account's quota in a TUI.
 
 Works on **macOS, Linux and Windows 11** — credentials go through the OS keyring
-(Keychain / Secret Service / Credential Manager) with a file fallback when no
-keyring is available.
+(Keychain / Secret Service / Credential Manager) with a file fallback, including
+SSH sessions where agy never touches the keyring.
 
 > This is a fork of [pr656d/agy-swap](https://github.com/pr656d/agy-swap) adding
 > cross-platform support and a corrected quota model. The published PyPI package
@@ -103,6 +103,7 @@ agyswap switch                 # rotate to the next enabled account
 agyswap switch 2               # by slot number
 agyswap switch user@gmail.com  # by email
 agyswap switch work            # by alias
+agyswap sync                   # restore the token file agy uses over SSH
 agyswap disable 2              # hold out of rotation (keeps credentials)
 agyswap enable 2
 agyswap alias 2 work
@@ -216,6 +217,10 @@ account its usage stays visible after you switch away.
 - **Switching does not affect a running agy session.** agy reads its token at
   startup and caches it in memory. Exit the session (or open a new terminal) for
   the change to take effect.
+- **A desktop agy can delete the SSH token file.** agy 1.5.x removes the file
+  when it refreshes a keyring token from a non-SSH session. Run
+  `agyswap sync --if-missing` before starting agy over SSH to restore it; see
+  [SSH and headless sessions](#ssh-and-headless-sessions).
 - **Quota is only known for accounts agy has reported on.** An account never used
   since you installed agy-swap shows `no samples yet` rather than a guess.
 - **Each machine has its own data.** `~/.agy-swap` (registry, backups, cache) is
@@ -229,7 +234,8 @@ account its usage stays visible after you switch away.
 
 - Backs up the OAuth token per account in `~/.agy-swap/credentials/`
 - Switching rewrites the live token in **every** store agy might read: the OS
-  keyring and the token file(s), so the two can never drift apart
+  keyring, both token files, and agy-swap's SSH mirror, so they can never drift
+  apart
 - Account identity is read from the token itself — the signed `id_token` JWT in
   the file, the `id_token_email` field some agy builds write to the Credential
   Manager, or Google's `userinfo` endpoint when a store keeps neither — so it
@@ -237,17 +243,59 @@ account its usage stays visible after you switch away.
 - Rejects a switch whose stored token belongs to a different account than the
   slot claims (prevents silently swapping in the wrong login)
 
-agy has kept its token in more than one file location across builds, so
-agy-swap probes both and uses whichever holds the fresher token:
+agy reads the OS keyring first, but switches to a file whenever the keyring is
+unreachable. agy 1.5.x treats an SSH session as exactly that case on every
+platform, and on Windows the keyring is also unusable at the OS level there
+(`ERROR_NO_SUCH_LOGON_SESSION`), so the file token is the only way in:
 
 | Data | Path |
 |---|---|
-| Active token (either location) | `~/.gemini/jetski-standalone-oauth-token` |
-| Active token (either location) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| Active token (primary) | OS keyring, target `gemini:antigravity` |
+| File token agy uses over SSH, in containers, and after a keyring failure | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| Token file kept for older builds and third-party tools | `~/.gemini/jetski-standalone-oauth-token` |
+| SSH mirror (agy-swap) | `~/.agy-swap/ssh-token.json` |
 | Legacy account pointer | `~/.gemini/google_accounts.json` (only `active` is touched) |
 | Credential backups | `~/.agy-swap/credentials/` |
 | Account registry | `~/.agy-swap/sequence.json` |
 | Quota cache | `~/.agy-swap/cache/quota.json` |
+
+### SSH and headless sessions
+
+agy deliberately skips the OS keyring when `SSH_CONNECTION`, `SSH_CLIENT`, or
+`SSH_TTY` is set. On Linux and macOS, `env -u SSH_CONNECTION -u SSH_CLIENT -u
+SSH_TTY agy` makes it read the keyring again. On Windows that cannot work: an
+SSH logon is a network logon, and Credential Manager refuses every call with
+`ERROR_NO_SUCH_LOGON_SESSION` (1312).
+
+`agyswap sync` writes the active token to both file locations and refreshes the
+keyring when it is reachable. Run it once from a desktop session to mirror the
+keyring token, then restore it over SSH after a reboot or after agy prunes the
+file:
+
+```bash
+agyswap sync                 # desktop: keyring -> files + ~/.agy-swap/ssh-token.json
+agyswap sync --if-missing    # SSH: restore only when agy's file is absent
+```
+
+To make each SSH `agy` start self-healing, wrap it in your PowerShell profile on
+the machine:
+
+```powershell
+function agy {
+    if ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) {
+        agyswap sync --if-missing --quiet
+    }
+    & "$env:LOCALAPPDATA\agy\bin\agy.exe" @args
+}
+```
+
+`--if-missing` never overwrites a token agy refreshed itself, and `--quiet`
+keeps the wrapper silent. `agyswap doctor` reports which storage agy will use in
+the current session, the file's state, and whether the mirror exists.
+
+> Upstream agy has two open issues here: there is no way to opt back into the
+> keyring over SSH, and a desktop refresh can delete the SSH token file. Until
+> those are fixed, the mirror plus `sync --if-missing` is the durable workaround.
 
 ### Environment overrides
 

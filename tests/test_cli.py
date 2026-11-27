@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agyswap import statusline
-from agyswap.cli import platform_label
+from tests import bootstrap  # noqa: F401 - isolate paths before importing agyswap
+
+from agyswap import paths, statusline  # noqa: E402
+from agyswap.cli import cmd_sync, platform_label  # noqa: E402
 
 
 class PlatformLabelTest(unittest.TestCase):
@@ -126,6 +128,37 @@ class ChainTest(unittest.TestCase):
         code, printed = self._run("   ", "TOK/s")
         self.assertEqual(code, 0)
         printed.assert_not_called()
+
+
+class SyncCliTest(unittest.TestCase):
+    def test_write_failure_exits_nonzero_even_when_quiet(self):
+        sw = mock.Mock()
+        sw.sync.return_value = {
+            "status": "synced",
+            "source": "keyring:wincred",
+            "email": "a@example.com",
+            "path": str(paths.SSH_TOKEN_PATH),
+            "targets": [],
+        }
+        args = mock.Mock(if_missing=False, quiet=True)
+        with mock.patch("agyswap.cli.console"):
+            with self.assertRaises(SystemExit) as ctx:
+                cmd_sync(sw, args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_quiet_success_prints_nothing(self):
+        sw = mock.Mock()
+        sw.sync.return_value = {
+            "status": "synced",
+            "source": "keyring:wincred",
+            "email": "a@example.com",
+            "path": str(paths.SSH_TOKEN_PATH),
+            "targets": [str(paths.SSH_TOKEN_PATH)],
+        }
+        args = mock.Mock(if_missing=False, quiet=True)
+        with mock.patch("agyswap.cli.console") as fake_console:
+            cmd_sync(sw, args)
+        fake_console.print.assert_not_called()
 
 
 if __name__ == "__main__":

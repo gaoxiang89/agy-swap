@@ -18,8 +18,10 @@ Design notes
 ------------
 * Reading probes *all* sources and keeps the token with the **latest expiry**,
   so a stale Keychain entry can never shadow a fresh file written by agy.
-* Writing fans out to the keyring and to every token file that already exists,
-  keeping them consistent.  If no file exists the canonical one is created.
+* Writing fans out to the keyring, to both token files and to agy-swap's
+  private mirror, keeping them consistent.  Every file target is created even
+  when it does not exist yet: an SSH session starts without a token file, and
+  agy will not consult the keyring there.
 * Every operation is best-effort: a failure on one backend never stops another
   and never raises.  ``agy-swap doctor`` reports what actually worked.
 """
@@ -49,6 +51,24 @@ IS_LINUX = sys.platform.startswith("linux")
 
 _CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
+#: Variables agy treats as proof that this is an SSH session.  When any is set
+#: agy ignores the OS keyring and reads :data:`agyswap.paths.SSH_TOKEN_PATH`.
+SSH_ENV_MARKERS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+
+
+def ssh_session() -> Optional[str]:
+    """Name of the variable marking this as an SSH session, or ``None``.
+
+    ``agy-swap doctor`` and ``agyswap sync`` use this to decide which storage
+    agy is actually going to read.  On Windows an SSH logon is a *network*
+    logon, where Credential Manager is not reachable at all, so removing the
+    variables (agy's documented Linux workaround) cannot help.
+    """
+    for name in SSH_ENV_MARKERS:
+        if os.environ.get(name):
+            return name
+    return None
+
 
 # ---------------------------------------------------------------------------
 # token helpers
@@ -63,7 +83,14 @@ def looks_like_token(text: Optional[str]) -> bool:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return False
-    return isinstance(parsed, dict)
+    if not isinstance(parsed, dict):
+        return False
+    inner = parsed.get("token")
+    if "token" in parsed and not isinstance(inner, dict):
+        return False
+    target = inner if isinstance(inner, dict) else parsed
+    value = target.get("access_token")
+    return isinstance(value, str) and bool(value)
 
 
 def token_json(text: Optional[str]) -> dict:
@@ -78,6 +105,63 @@ def token_json(text: Optional[str]) -> dict:
         return {}
     inner = parsed.get("token")
     return inner if isinstance(inner, dict) else parsed
+
+
+def ensure_token_document(text: Optional[str]) -> Optional[str]:
+    """Return ``text`` in the envelope agy 1.5.x expects, or ``None``.
+
+    agy accepts two shapes on disk:
+
+    * ``{"token": {...}, "auth_method": "consumer"}`` -- what both the keyring
+      and the file store carry;
+    * a bare credential object (``{"access_token": ...}``), which older builds
+      and some tools write.
+
+    1.5.x rejects the bare shape when it reads its file store, so wrap it.
+    Already-wrapped documents are returned untouched, byte for byte.
+    """
+    if not looks_like_token(text):
+        return None
+    try:
+        parsed = json.loads(text)  # type: ignore[arg-type]
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if isinstance(parsed.get("token"), dict):
+        return text
+
+    reserved = {"auth_method", "id_token_email"}
+    auth_method = parsed.get("auth_method")
+    document: dict = {
+        "token": {
+            key: value for key, value in parsed.items() if key not in reserved
+        },
+        "auth_method": (
+            auth_method if isinstance(auth_method, str) and auth_method else "consumer"
+        ),
+    }
+    id_token_email = parsed.get("id_token_email")
+    if isinstance(id_token_email, str) and id_token_email:
+        document["id_token_email"] = id_token_email
+    return json.dumps(document)
+
+
+def has_wrapped_token(path: Path) -> bool:
+    """True when ``path`` holds a wrapped token document agy 1.5.x accepts."""
+    try:
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if not looks_like_token(text):
+        return False
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and isinstance(parsed.get("token"), dict)
 
 
 def access_token(text: Optional[str]) -> Optional[str]:
@@ -696,6 +780,35 @@ def _file_candidates() -> list[tuple[str, Path]]:
     return found
 
 
+def read_token_mirror() -> Optional[str]:
+    """The token copy agy-swap saved for file-only sessions, if any."""
+    try:
+        text = paths.SSH_TOKEN_MIRROR.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return ensure_token_document(text)
+
+
+def write_token_mirror(content: str) -> bool:
+    """Persist ``content`` to the private SSH mirror, wrapped and ACL-locked."""
+    document = ensure_token_document(content)
+    if document is None:
+        return False
+    try:
+        atomic_write(paths.SSH_TOKEN_MIRROR, document, secure=True)
+        return True
+    except Exception:
+        return False
+
+
+def delete_token_mirror() -> None:
+    """Remove the private SSH mirror, if present."""
+    try:
+        paths.SSH_TOKEN_MIRROR.unlink()
+    except OSError:
+        pass
+
+
 def _scored_candidates() -> list[tuple[tuple[float, float], str, str]]:
     """Every readable token on this machine, freshest last.
 
@@ -753,19 +866,33 @@ def live_tokens() -> list[tuple[str, str]]:
 
 
 def write_token(content: str) -> list[str]:
-    """Write ``content`` everywhere agy might look.  Returns what succeeded."""
+    """Write ``content`` everywhere agy might look.  Returns what succeeded.
+
+    The token is normalized to the ``{"token": ..., "auth_method": ...}``
+    envelope first: agy 1.5.x rejects a bare credential object when it reads
+    its file store.  Every file target is written, not only the files that
+    already exist -- a fresh SSH session starts with no token file, and writing
+    just ``jetski-standalone-oauth-token`` (which 1.5.x ignores over SSH) is
+    what left those sessions logged out.
+    """
+    document = ensure_token_document(content)
+    if document is None:
+        return []
+
     written: list[str] = []
-    if write_keyring(content):
+    if write_keyring(document):
         written.append(f"keyring:{_keyring_backend()}")
 
-    existing = [path for path in paths.TOKEN_CANDIDATES if path.exists()]
-    targets = existing or [paths.TOKEN_PATH]
-    for path in targets:
+    for path in paths.TOKEN_CANDIDATES:
         try:
-            atomic_write(path, content)
+            atomic_write(path, document, secure=True)
             written.append(str(path))
         except Exception:
             continue
+
+    # Keep a private copy the SSH session can restore from without the keyring.
+    if write_token_mirror(document):
+        written.append(str(paths.SSH_TOKEN_MIRROR))
     return written
 
 

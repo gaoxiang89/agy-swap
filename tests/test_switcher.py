@@ -324,6 +324,164 @@ class SwitchTest(SwitcherTestCase):
         self.assertTrue(result["targets"])
 
 
+class SyncTest(SwitcherTestCase):
+    def _remove_live_files(self):
+        for path in (paths.SSH_TOKEN_PATH, paths.TOKEN_PATH):
+            path.unlink(missing_ok=True)
+
+    def test_sync_requires_a_token(self):
+        switcher = AgySwitcher()
+        with self.assertRaises(AgyError):
+            switcher.sync()
+
+    def test_sync_writes_every_target(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        result = switcher.sync()
+        self.assertEqual(result["status"], "synced")
+        for path in (paths.SSH_TOKEN_PATH, paths.TOKEN_PATH, paths.SSH_TOKEN_MIRROR):
+            self.assertTrue(path.exists(), path)
+
+    def test_sync_restores_the_active_backup(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        self._remove_live_files()
+        result = switcher.sync()
+        self.assertEqual(result["source"], "backup:alice@example.com")
+        self.assertEqual(
+            credentials.email_from_token(
+                paths.SSH_TOKEN_PATH.read_text(encoding="utf-8"),
+                allow_network=False,
+            ),
+            "alice@example.com",
+        )
+
+    def test_sync_prefers_the_keyring(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        ring = make_token("ring@example.com", expiry=time.time() + 7200)
+        with mock.patch.object(credentials, "read_keyring", return_value=ring):
+            result = switcher.sync()
+        self.assertTrue(result["source"].startswith("keyring:"))
+        self.assertEqual(
+            credentials.email_from_token(
+                paths.SSH_TOKEN_PATH.read_text(encoding="utf-8"),
+                allow_network=False,
+            ),
+            "ring@example.com",
+        )
+
+    def test_sync_if_missing_leaves_an_existing_file_alone(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        paths.SSH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        paths.SSH_TOKEN_PATH.write_text(
+            make_token("agy@example.com"), encoding="utf-8"
+        )
+        result = switcher.sync(if_missing=True)
+        self.assertEqual(result["status"], "present")
+        self.assertEqual(result["targets"], [])
+        self.assertEqual(
+            credentials.email_from_token(
+                paths.SSH_TOKEN_PATH.read_text(encoding="utf-8"),
+                allow_network=False,
+            ),
+            "agy@example.com",
+        )
+
+    def test_sync_restores_from_the_mirror(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        switcher.sync()
+        self._remove_live_files()
+        result = switcher.sync()
+        self.assertEqual(result["source"], str(paths.SSH_TOKEN_MIRROR))
+
+    def test_sync_fresher_backup_beats_stale_file_and_is_not_clobbered(self):
+        """Desktop 'agyswap add' refreshes backup without touching legacy files."""
+        stale_ts = time.time() + 60
+        fresh_ts = time.time() + 7200
+        self.set_live_token("alice@example.com", expiry=stale_ts)
+        switcher = AgySwitcher()
+        switcher.add_current()
+        switcher.sync()
+
+        # Simulate desktop agy refreshing keyring and pruning SSH_TOKEN_PATH,
+        # followed by 'agyswap add' on desktop, then 'agyswap sync' over SSH.
+        paths.SSH_TOKEN_PATH.unlink(missing_ok=True)
+        fresh = make_token("alice@example.com", expiry=fresh_ts, access="fresh-tok")
+        with mock.patch.object(credentials, "read_keyring", return_value=fresh):
+            switcher.add_current()
+
+        result = switcher.sync()
+        self.assertEqual(credentials.access_token(
+            paths.SSH_TOKEN_PATH.read_text(encoding="utf-8")
+        ), "fresh-tok")
+        self.assertEqual(
+            credentials.access_token(
+                credentials.read_token_backup(1, "alice@example.com")
+            ),
+            "fresh-tok",
+        )
+        self.assertIn(result["source"], (str(paths.SSH_TOKEN_MIRROR), "backup:alice@example.com"))
+
+    def test_sync_if_missing_repairs_corrupt_or_bare_file(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        paths.SSH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        paths.SSH_TOKEN_PATH.write_text("", encoding="utf-8")
+        result = switcher.sync(if_missing=True)
+        self.assertEqual(result["status"], "synced")
+        self.assertTrue(credentials.has_wrapped_token(paths.SSH_TOKEN_PATH))
+
+        bare = json.dumps({"access_token": "bare-a", "refresh_token": "bare-r"})
+        paths.SSH_TOKEN_PATH.write_text(bare, encoding="utf-8")
+        result = switcher.sync(if_missing=True)
+        self.assertEqual(result["status"], "synced")
+        self.assertTrue(credentials.has_wrapped_token(paths.SSH_TOKEN_PATH))
+
+    def test_sync_updates_active_email_for_managed_account(self):
+        self.set_live_token("alice@example.com", expiry=time.time() + 60)
+        switcher = AgySwitcher()
+        switcher.add_current()
+        self.set_live_token("bob@example.com", expiry=time.time() + 120)
+        switcher.add_current()
+        switcher.switch("1")
+
+        # Desktop switches keyring to bob and user runs sync; later backup fallback
+        # must remember bob rather than alice.
+        ring_bob = make_token("bob@example.com", expiry=time.time() + 7200)
+        with mock.patch.object(credentials, "read_keyring", return_value=ring_bob):
+            switcher.sync()
+        self._remove_live_files()
+        credentials.delete_token_mirror()
+
+        switcher.reload()
+        result = switcher.sync()
+        self.assertEqual(result["source"], "backup:bob@example.com")
+
+    def test_active_account_skips_disabled_active_email(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        self.set_live_token("bob@example.com")
+        switcher.add_current()
+        switcher.switch("1")
+        switcher.set_disabled("1", True)
+        self._remove_live_files()
+        credentials.delete_token_mirror()
+
+        result = switcher.sync()
+        self.assertEqual(result["source"], "backup:bob@example.com")
+
+
 class RemoveTest(SwitcherTestCase):
     def test_remove_drops_registry_and_backup(self):
         self.set_live_token("alice@example.com")
@@ -375,6 +533,38 @@ class RemoveTest(SwitcherTestCase):
         self.assertEqual(switcher.switch("1")["active"], "alice@example.com")
         self.assertEqual(switcher.renumber(), 0)
 
+    def test_remove_cleans_matching_mirror_so_sync_cannot_resurrect(self):
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        switcher.sync()
+        self.assertTrue(paths.SSH_TOKEN_MIRROR.exists())
+
+        switcher.remove_account("1")
+        self.assertFalse(paths.SSH_TOKEN_MIRROR.exists())
+        for path in (paths.SSH_TOKEN_PATH, paths.TOKEN_PATH):
+            path.unlink(missing_ok=True)
+        with self.assertRaises(AgyError):
+            switcher.sync()
+
+    def test_sync_restores_backup_after_remove_renumbers_slots(self):
+        """After slot #1 is removed, slot #2 becomes #1 while keeping credential_number=2."""
+        self.set_live_token("alice@example.com")
+        switcher = AgySwitcher()
+        switcher.add_current()
+        self.set_live_token("bob@example.com")
+        switcher.add_current()
+        switcher.sync()
+
+        # Remove alice (#1); bob moves to slot #1 with credential_number=2.
+        switcher.remove_account("1")
+        for path in (paths.SSH_TOKEN_PATH, paths.TOKEN_PATH):
+            path.unlink(missing_ok=True)
+        credentials.delete_token_mirror()
+
+        result = switcher.sync()
+        self.assertEqual(result["source"], "backup:bob@example.com")
+        self.assertEqual(result["email"], "bob@example.com")
 
 class LegacyIdentityTest(SwitcherTestCase):
     def test_falls_back_to_google_accounts(self):

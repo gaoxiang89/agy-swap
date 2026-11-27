@@ -2,6 +2,7 @@ import base64
 import json
 import time
 import unittest
+from unittest import mock
 
 from tests import bootstrap
 
@@ -38,11 +39,75 @@ class LooksLikeTokenTest(unittest.TestCase):
         self.assertTrue(credentials.looks_like_token(make_token()))
 
     def test_rejects_garbage(self):
-        for value in (None, "", "not json", "{}", '{"a": 1}'):
+        for value in (
+            None,
+            "",
+            "not json",
+            "{}",
+            '{"a": 1}',
+            '{"access_token": ""}',
+            '{"foo": "access_token"}',
+            '{"token": "access_token"}',
+            '{"token": {}, "note": "access_token"}',
+        ):
             self.assertFalse(credentials.looks_like_token(value), value)
 
     def test_rejects_json_list(self):
         self.assertFalse(credentials.looks_like_token('[{"access_token": "x"}]'))
+
+
+class TokenDocumentTest(unittest.TestCase):
+    """agy 1.5.x rejects a bare credential object in its file store."""
+
+    def setUp(self):
+        bootstrap.reset()
+
+    def test_bare_object_is_wrapped(self):
+        bare = json.dumps({"access_token": "a", "refresh_token": "r"})
+        document = json.loads(credentials.ensure_token_document(bare))
+        self.assertEqual(document["token"]["access_token"], "a")
+        self.assertEqual(document["token"]["refresh_token"], "r")
+        self.assertEqual(document["auth_method"], "consumer")
+
+    def test_wrapped_document_is_untouched(self):
+        token = make_token("a@example.com")
+        self.assertEqual(credentials.ensure_token_document(token), token)
+
+    def test_top_level_hints_move_outside_the_token(self):
+        bare = json.dumps(
+            {
+                "access_token": "a",
+                "auth_method": "consumer",
+                "id_token_email": "a@example.com",
+            }
+        )
+        document = json.loads(credentials.ensure_token_document(bare))
+        self.assertNotIn("id_token_email", document["token"])
+        self.assertEqual(document["id_token_email"], "a@example.com")
+
+    def test_rejects_garbage(self):
+        for value in (
+            None,
+            "",
+            "not json",
+            "{}",
+            '{"token": "x"}',
+            '{"token": "access_token"}',
+            '{"foo": "access_token"}',
+            '{"token": {}, "comment": "access_token"}',
+        ):
+            self.assertIsNone(credentials.ensure_token_document(value), value)
+
+    def test_has_wrapped_token_requires_envelope(self):
+        target = paths.SSH_TOKEN_PATH
+        self.assertFalse(credentials.has_wrapped_token(target))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+        self.assertFalse(credentials.has_wrapped_token(target))
+        target.write_text(json.dumps({"access_token": "bare"}), encoding="utf-8")
+        self.assertFalse(credentials.has_wrapped_token(target))
+        target.write_text(make_token("ok@example.com"), encoding="utf-8")
+        self.assertTrue(credentials.has_wrapped_token(target))
 
 
 class EmailExtractionTest(unittest.TestCase):
@@ -185,6 +250,56 @@ class AtomicWriteTest(unittest.TestCase):
             "gaoxiang89ly@gmail.com",
         )
         self.assertIsNone(credentials.email_from_backup_slug("no-marker"))
+
+
+class WriteTokenTest(unittest.TestCase):
+    def setUp(self):
+        bootstrap.reset()
+        patcher = mock.patch.object(credentials, "write_keyring", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_writes_both_files_and_the_mirror(self):
+        written = credentials.write_token(make_token("a@example.com"))
+        for path in (paths.SSH_TOKEN_PATH, paths.TOKEN_PATH, paths.SSH_TOKEN_MIRROR):
+            self.assertIn(str(path), written)
+            self.assertTrue(path.exists(), path)
+
+    def test_bare_token_is_wrapped_on_disk(self):
+        bare = json.dumps({"access_token": "a", "refresh_token": "r"})
+        credentials.write_token(bare)
+        document = json.loads(paths.SSH_TOKEN_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(document["token"]["access_token"], "a")
+        self.assertEqual(document["auth_method"], "consumer")
+
+    def test_invalid_content_writes_nothing(self):
+        self.assertEqual(credentials.write_token("not a token"), [])
+        self.assertFalse(paths.SSH_TOKEN_PATH.exists())
+        self.assertFalse(paths.SSH_TOKEN_MIRROR.exists())
+
+
+class TokenMirrorTest(unittest.TestCase):
+    def setUp(self):
+        bootstrap.reset()
+
+    def test_mirror_round_trips(self):
+        token = make_token("mirror@example.com")
+        paths.SSH_TOKEN_MIRROR.write_text(token, encoding="utf-8")
+        self.assertEqual(credentials.read_token_mirror(), token)
+
+    def test_absent_mirror_is_none(self):
+        self.assertIsNone(credentials.read_token_mirror())
+
+    def test_garbage_mirror_is_none(self):
+        paths.SSH_TOKEN_MIRROR.write_text("{}", encoding="utf-8")
+        self.assertIsNone(credentials.read_token_mirror())
+
+    def test_write_and_delete_mirror(self):
+        token = make_token("mirror@example.com")
+        self.assertTrue(credentials.write_token_mirror(token))
+        self.assertEqual(credentials.read_token_mirror(), token)
+        credentials.delete_token_mirror()
+        self.assertIsNone(credentials.read_token_mirror())
 
 
 class TokenSelectionTest(unittest.TestCase):

@@ -101,6 +101,35 @@ def cmd_status(sw: AgySwitcher, args) -> None:
     console.print(f"Managed: {managed}")
     if info["number"]:
         console.print(f"Slot: #{info['number']}")
+    if credentials.ssh_session() and not credentials.has_wrapped_token(paths.SSH_TOKEN_PATH):
+        console.print(
+            "[yellow]Note:[/yellow] agy's SSH token file is missing or invalid — "
+            "run [bold]agyswap sync[/bold] before starting agy."
+        )
+
+
+def cmd_sync(sw: AgySwitcher, args) -> None:
+    try:
+        result = sw.sync(if_missing=args.if_missing)
+    except AgyError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    if result["status"] == "present":
+        if not args.quiet:
+            console.print(f"[dim]Token file already present:[/dim] {result['path']}")
+        return
+    if result["path"] not in result["targets"]:
+        console.print(
+            f"[red]Error:[/red] could not write {result['path']}. "
+            "Run [bold]agyswap doctor[/bold]."
+        )
+        sys.exit(1)
+    if args.quiet:
+        return
+    console.print(f"[green]Synced[/green] token from {result['source']}")
+    for target in result["targets"]:
+        console.print(f"  {target}")
+    console.print("[dim]Restart agy for the token to take effect.[/dim]")
 
 
 def cmd_add(sw: AgySwitcher, args) -> None:
@@ -246,9 +275,46 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
     )
     table.add_row("gemini dir", str(paths.GEMINI_DIR) + ("" if paths.GEMINI_DIR.exists() else " [red](missing)[/red]"))
 
+    ssh_marker = credentials.ssh_session()
+    if ssh_marker:
+        table.add_row(
+            "session",
+            f"[yellow]SSH[/yellow] ({ssh_marker}) · agy uses file token storage",
+        )
+    else:
+        table.add_row("session", "local · agy may use the keyring")
+
     ring = credentials.keyring_status()
-    ring_state = "[green]available[/green]" if ring["available"] else "[yellow]not found[/yellow]"
+    if ssh_marker:
+        ring_state = "[yellow]bypassed in SSH[/yellow]"
+    elif ring["available"]:
+        ring_state = "[green]available[/green]"
+    else:
+        ring_state = "[yellow]not found[/yellow]"
     table.add_row("keyring", f"{ring['backend']} · {ring_state}")
+
+    file_token = paths.SSH_TOKEN_PATH
+    if credentials.has_wrapped_token(file_token):
+        file_state = "[green]present[/green]"
+    elif file_token.exists():
+        file_state = "[yellow]invalid/unwrapped — run 'agyswap sync'[/yellow]"
+    else:
+        file_state = "[red]missing[/red]"
+    table.add_row("file token", f"{file_token} · {file_state}")
+
+    mirror = paths.SSH_TOKEN_MIRROR
+    if credentials.read_token_mirror() is not None:
+        table.add_row("ssh mirror", f"{mirror} · [green]present[/green]")
+    elif mirror.exists():
+        table.add_row(
+            "ssh mirror",
+            f"{mirror} · [yellow]corrupt — run 'agyswap sync'[/yellow]",
+        )
+    else:
+        table.add_row(
+            "ssh mirror",
+            f"{mirror} · [dim]missing — run 'agyswap sync' on a desktop session[/dim]",
+        )
 
     def _expiry_text(text: str) -> str:
         expiry = credentials.token_expiry(text)
@@ -266,7 +332,10 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
         )
     elif len(live) == 1:
         source, text = live[-1]
-        table.add_row("token", f"{_source_label(source)} · {_expiry_text(text)}")
+        token_detail = f"{_source_label(source)} · {_expiry_text(text)}"
+        if ssh_marker and source != str(file_token):
+            token_detail += " [yellow](ignored by agy in SSH)[/yellow]"
+        table.add_row("token", token_detail)
         table.add_row(
             "identity",
             credentials.email_from_token(text, allow_network=False)
@@ -283,10 +352,10 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
         )
         for source, text in reversed(live):
             email = credentials.email_from_token(text) or "unknown"
-            table.add_row(
-                "",
-                f"{_source_label(source)} · {email} · {_expiry_text(text)}",
-            )
+            line = f"{_source_label(source)} · {email} · {_expiry_text(text)}"
+            if ssh_marker and source != str(file_token):
+                line += " [yellow](ignored by agy in SSH)[/yellow]"
+            table.add_row("", line)
 
     accounts = sw.list_accounts()
     table.add_row("accounts", str(len(accounts)) if accounts else "[dim]none[/dim]")
@@ -325,6 +394,13 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
         console.print(
             "\n[yellow]The active token has expired.[/yellow] Run [bold]agy[/bold] once "
             "to refresh it, or configure OAuth refresh (see README)."
+        )
+
+    if ssh_marker and not credentials.has_wrapped_token(file_token):
+        console.print(
+            "\n[yellow]agy cannot use the OS keyring from this SSH session.[/yellow]\n"
+            "Run [bold]agyswap sync[/bold] to restore its token file, or run it once "
+            "from a desktop session to mirror the keyring token."
         )
 
 
@@ -399,6 +475,8 @@ def main() -> None:
   agyswap switch           rotate to next enabled account
   agyswap switch 2         switch to account #2
   agyswap switch email     switch to account by email
+  agyswap sync             restore the token file agy uses over SSH
+  agyswap sync --if-missing  only when agy's token file is missing
   agyswap disable 2        hold an account out of rotation
   agyswap enable 2         return an account to rotation
   agyswap remove 1 2       remove accounts and close gaps
@@ -426,6 +504,15 @@ def main() -> None:
 
     p_switch = sub.add_parser("switch", help="switch accounts")
     p_switch.add_argument("identifier", nargs="?", help="account number, email, or alias")
+
+    p_sync = sub.add_parser(
+        "sync", help="write the active token to agy's file store (SSH sessions)"
+    )
+    p_sync.add_argument(
+        "--if-missing", action="store_true",
+        help="do nothing when agy's token file already exists",
+    )
+    p_sync.add_argument("--quiet", action="store_true", help="no output on success")
 
     p_remove = sub.add_parser("remove", aliases=["rm"], help="remove accounts and close gaps")
     p_remove.add_argument("identifiers", nargs="+", help="account numbers, emails, or aliases")
@@ -468,6 +555,7 @@ def main() -> None:
         "add": cmd_add,
         "recover": cmd_recover,
         "switch": cmd_switch,
+        "sync": cmd_sync,
         "remove": cmd_remove,
         "rm": cmd_remove,
         "renumber": cmd_renumber,
