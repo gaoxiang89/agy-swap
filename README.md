@@ -35,7 +35,7 @@ pipx install "git+https://github.com/gaoxiang89/agy-swap"
 Useful for keeping several machines identical:
 
 ```bash
-uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@v0.4.0" agy-swap
+uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@v0.4.1" agy-swap
 
 # no tag needed — any commit works
 uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@72288cc" agy-swap
