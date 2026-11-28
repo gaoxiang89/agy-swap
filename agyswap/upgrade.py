@@ -61,6 +61,7 @@ class Step:
     replaces: list[Path] = field(default_factory=list)
     #: What to tell the user when the step fails.
     retry_hint: str = ""
+    uv_prefix: Path | None = None
 
 
 def _dist_info(prefix: Path) -> Path | None:
@@ -190,7 +191,8 @@ def plan(install: Install) -> list[Step]:
         if len(bin_dirs) == 1:
             env["UV_TOOL_BIN_DIR"] = str(launchers[0].parent)
         steps.append(Step([uv, "tool", "upgrade", DIST], env, launchers,
-                          _RETRY.format(f"uv tool upgrade --reinstall {DIST}")))
+                          _RETRY.format(f"uv tool upgrade --reinstall {DIST}"),
+                          uv_prefix=install.prefix))
     elif install.manager == "pipx":
         pipx = shutil.which("pipx")
         if not pipx:
@@ -229,7 +231,29 @@ def must_hand_off(step: Step, argv0: str | None = None) -> bool:
 
 
 _HELPER = r"""
-import ctypes, json, os, subprocess, sys
+import ctypes, filecmp, json, os, subprocess, sys
+from importlib.metadata import Distribution
+from pathlib import Path
+
+
+def uv_launchers_match(prefix, launchers):
+    prefix = Path(prefix)
+    site_packages = prefix / "Lib" / "site-packages"
+    installed = next(Distribution.discover(name="agy-swap", path=[site_packages]), None)
+    if installed is None:
+        return False
+    expected = {entry.name.casefold() + ".exe" for entry in installed.entry_points
+                if entry.group == "console_scripts"}
+    paths = [Path(path) for path in launchers]
+    if not expected or not expected.issubset(path.name.casefold() for path in paths):
+        return False
+    try:
+        return all(filecmp.cmp(prefix / "Scripts" / path.name, path, shallow=False)
+                   for path in paths)
+    except OSError:
+        return False
+
+
 job = json.loads(sys.argv[1])
 kernel32 = ctypes.windll.kernel32
 handle = kernel32.OpenProcess(0x00100000, False, job["wait_pid"])  # SYNCHRONIZE
@@ -240,7 +264,21 @@ env = dict(os.environ)
 env.update(job["env"])
 print(flush=True)
 try:
-    code = subprocess.call(job["argv"], env=env)
+    if job["uv_prefix"]:
+        result = subprocess.run(job["argv"], env=env, stderr=subprocess.PIPE)
+        code = result.returncode
+        output = result.stderr
+        progress, error, detail = output.partition(b"error: Failed to upgrade agy-swap")
+        if (code and error and b"Updated agy-swap " in progress
+                and b"Failed to install entrypoint" in detail
+                and b"(os error 32)" in detail
+                and uv_launchers_match(job["uv_prefix"], job["launchers"])):
+            output = progress + b"agy-swap: verified the existing Windows launchers.\n"
+            code = 0
+        sys.stderr.buffer.write(output)
+        sys.stderr.flush()
+    else:
+        code = subprocess.call(job["argv"], env=env)
 except OSError as exc:
     print(exc)
     code = 1
@@ -256,6 +294,8 @@ def hand_off(step: Step, wait_pid: int | None = None) -> None:
         "argv": step.argv,
         "env": step.env,
         "failed": f"agy-swap: upgrade failed. {step.retry_hint}",
+        "uv_prefix": str(step.uv_prefix) if step.uv_prefix else None,
+        "launchers": [str(path) for path in step.replaces],
     }
     # The base interpreter, not the tool environment's: the helper must import
     # nothing from the files it is about to replace.

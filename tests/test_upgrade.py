@@ -182,6 +182,59 @@ class HandOffTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started, 2)
         self.assertTrue(marker.read_text(encoding="utf-8").startswith("ok "))
 
+    @unittest.skipUnless(sys.platform == "win32", "the helper waits with Win32 APIs")
+    def test_uv_sharing_error_is_recovered_only_for_matching_launchers(self):
+        with tempfile.TemporaryDirectory(prefix="agyswap-handoff-") as directory:
+            root = Path(directory)
+            install = FakeEnv(root, "uv", version="0.4.0")
+            dist = upgrade._dist_info(install.prefix)
+            (dist / "entry_points.txt").write_text(
+                "[console_scripts]\nagyswap = agyswap.cli:main\n"
+                "agyswap-statusline = agyswap.statusline:main\n",
+                encoding="utf-8",
+            )
+            scripts = install.prefix / "Scripts"
+            scripts.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            launchers = [bin_dir / name for name in ("agyswap.exe", "agyswap-statusline.exe")]
+            for launcher in launchers:
+                content = launcher.name.encode("ascii")
+                (scripts / launcher.name).write_bytes(content)
+                launcher.write_bytes(content)
+
+            progress = "Updated agy-swap v0.3.0 -> v0.4.0"
+            error = "error: Failed to upgrade agy-swap"
+            sharing = "  Caused by: Failed to install entrypoint (os error 32)"
+
+            def run_helper(launchers, cause):
+                output = "\n".join((progress, error, cause))
+                step = upgrade.Step(
+                    [sys.executable, "-c", f"import sys; print({output!r}, file=sys.stderr); sys.exit(1)"],
+                    replaces=launchers,
+                    uv_prefix=install.prefix,
+                )
+                with mock.patch.object(upgrade.subprocess, "Popen") as spawn:
+                    upgrade.hand_off(step, wait_pid=0)
+                return subprocess.run(spawn.call_args.args[0], capture_output=True, text=True)
+
+            result = run_helper(launchers, sharing)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr.splitlines(), [
+                progress, "agy-swap: verified the existing Windows launchers.",
+            ])
+            self.assertIn("upgrade finished", result.stdout)
+
+            for paths, cause in ((launchers[:1], sharing), (launchers, "Network error")):
+                result = run_helper(paths, cause)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(cause, result.stderr)
+
+            launchers[1].write_bytes(b"stale")
+            result = run_helper(launchers, sharing)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(sharing, result.stderr)
+
 
 class CommandTest(unittest.TestCase):
     def _run(self, install, steps, *argv):

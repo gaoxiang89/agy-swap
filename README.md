@@ -80,10 +80,12 @@ Both re-resolve from the recorded git source, so they never swap in the
 macOS-only PyPI release. An install pinned to a tag or commit stays on it;
 re-run the install command with a newer revision, or without one, to move on.
 
-On Windows a running `agyswap.exe` cannot be replaced, so the upgrade finishes
-in the same window right after `agyswap` exits. If it reports that a file is in
-use, close any other agyswap (a dashboard, or agy's status line) and run
-`uv tool upgrade --reinstall agy-swap`.
+On Windows the upgrade runs in the same window after the `agyswap upgrade`
+launcher exits. Other `agyswap` processes can still hold the launcher open.
+If uv updates the package and every existing launcher matches the upgraded
+environment, `agyswap upgrade` reports success. For a launcher that needs
+replacement, retry with `uv tool upgrade --reinstall agy-swap` once the
+process holding it has exited.
 
 ## First run
 
