@@ -35,7 +35,7 @@ pipx install "git+https://github.com/gaoxiang89/agy-swap"
 Useful for keeping several machines identical:
 
 ```bash
-uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@v0.3.0" agy-swap
+uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@v0.4.0" agy-swap
 
 # no tag needed — any commit works
 uv tool install --from "git+https://github.com/gaoxiang89/agy-swap@72288cc" agy-swap
@@ -89,12 +89,18 @@ use, close any other agyswap (a dashboard, or agy's status line) and run
 
 ```bash
 agyswap doctor               # what agy-swap can see: keyring, token, identity
-agyswap add                  # capture every live agy login as accounts
+agyswap login                # sign in to a new account in isolation
 agyswap statusline --setup   # enable live quota (see "Quota data")
 agyswap                      # open the dashboard
 ```
 
-To add another account, log into it with `agy`, then run `agyswap add` again.
+`agyswap login` opens agy's Google sign-in flow using a temporary Gemini root
+and file-only credentials. After you complete sign-in, it saves the account
+and prints the `agyswap run <account>` command to start a session with it.
+This leaves running agy sessions, the shared keyring, and the default token
+files alone. It requires a version of agy with `agy acp --login`.
+
+To import existing agy logins, run `agyswap add`.
 
 `agyswap add` registers **every** live login it can see, not just the newest
 one. An agy install can hold two different accounts at once — for example a
@@ -110,6 +116,7 @@ Backups outlive the registry: if `~/.agy-swap/sequence.json` is lost or reset,
 ## Usage
 
 ```bash
+agyswap login                  # sign in to a new account in isolation
 agyswap add                    # capture the live agy login(s) as accounts
 agyswap recover               # re-adopt accounts from orphaned token backups
 agyswap list                   # list accounts, tokens and quota

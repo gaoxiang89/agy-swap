@@ -4,6 +4,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -66,7 +67,10 @@ def cmd_list(sw: AgySwitcher, args) -> None:
     rows = sw.list_accounts()
     if not rows:
         console.print("[dim]No accounts managed yet.[/dim]")
-        console.print("Login with [bold]agy[/bold] first, then run [bold]agyswap add[/bold].")
+        console.print(
+            "Run [bold]agyswap login[/bold] to sign in or "
+            "[bold]agyswap add[/bold] to import an existing login."
+        )
         return
 
     table = Table(box=box.ROUNDED)
@@ -177,6 +181,45 @@ def _launch_agy(argv: list[str], env: dict) -> int:
     return subprocess.run(argv, env=env).returncode
 
 
+def _isolated_agy_env() -> dict[str, str]:
+    # The OS keyring's single token slot is shared across Gemini roots.
+    return {**os.environ, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE": "1"}
+
+
+def cmd_login(sw: AgySwitcher, args) -> None:
+    executable = _agy_executable()
+    if not executable:
+        error_console.print(
+            "[red]Error:[/red] cannot find agy. Install Antigravity CLI or set "
+            "[bold]AGY_EXE[/bold] to its executable."
+        )
+        sys.exit(1)
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="login-", dir=paths.BACKUP_ROOT
+        ) as directory:
+            profile = Path(directory)
+            credentials.secure_dir(profile)
+            argv = [executable, "acp", "--login", f"--gemini_dir={profile}"]
+            code = _launch_agy(argv, _isolated_agy_env())
+            if code != 0:
+                error_console.print(f"[red]agy login failed[/red] (exit {code}).")
+                sys.exit(code)
+            account = sw.import_profile_login(profile)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, AgyError) as exc:
+        error_console.print(f"Error: {exc}", markup=False, highlight=False)
+        sys.exit(1)
+
+    console.print(
+        f"Saved account #{account.number}: {account.email}. "
+        f"Start it with agyswap run {account.number}.",
+        markup=False,
+    )
+
+
 def cmd_run(sw: AgySwitcher, args) -> None:
     """Launch agy with one account's private Gemini root."""
     agy_args = list(args.agy_args or [])
@@ -202,11 +245,7 @@ def cmd_run(sw: AgySwitcher, args) -> None:
         sys.exit(1)
 
     profile = Path(info["profile"])
-    env = os.environ.copy()
-    # The OS keyring has one global slot (gemini:antigravity) and is not
-    # namespaced by --gemini_dir, so file storage is what makes the profile
-    # independent.  Set it here instead of relying on the caller's shell.
-    env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] = "1"
+    env = _isolated_agy_env()
     # Statusline quota capture runs as a child of agy; this tells it which
     # account the samples belong to even when the payload omits an email.
     env["AGYSWAP_PROFILE_EMAIL"] = info["email"]
@@ -640,6 +679,7 @@ def main() -> None:
         description="Multi-account switcher for Antigravity CLI (agy)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
+  agyswap login            sign in to an isolated agy profile and save the account
   agyswap add              capture every live login as a managed account
   agyswap recover          re-adopt accounts from orphaned token backups
   agyswap list             list managed accounts
@@ -668,6 +708,7 @@ def main() -> None:
 
     sub.add_parser("list", help="list managed accounts")
     sub.add_parser("status", help="show current active account")
+    sub.add_parser("login", help="sign in to an isolated agy profile and save the account")
     p_add = sub.add_parser("add", help="capture current agy login as a managed account")
     p_add.add_argument("--email", help="email for the account (auto-detected if omitted)")
 
@@ -742,6 +783,7 @@ def main() -> None:
     dispatch = {
         "list": cmd_list,
         "status": cmd_status,
+        "login": cmd_login,
         "add": cmd_add,
         "recover": cmd_recover,
         "switch": cmd_switch,

@@ -1,5 +1,6 @@
 """OS labelling used by ``agyswap doctor``, and the status-line launcher."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -333,6 +334,103 @@ class RunCliTest(unittest.TestCase):
         args = handler.call_args.args[1]
         self.assertEqual(args.identifier, "2")
         self.assertEqual(args.agy_args, ["--print", "hi"])
+
+
+class LoginCliTest(unittest.TestCase):
+    def setUp(self):
+        bootstrap.reset()
+        keyring = mock.patch.object(credentials, "read_keyring", return_value=None)
+        with keyring:
+            paths.TOKEN_PATH.write_text(make_token("current@example.com"), encoding="utf-8")
+            switcher = AgySwitcher()
+            self.current = switcher.add_current()
+            profile = Path(switcher.prepare_profile("1")["profile"])
+
+        profile_token, _ = credentials.profile_token_paths(profile)
+        paths.SSH_TOKEN_PATH.parent.mkdir()
+        paths.SSH_TOKEN_PATH.write_text(make_token("ssh@example.com"), encoding="utf-8")
+        paths.SSH_TOKEN_MIRROR.write_bytes(paths.SSH_TOKEN_PATH.read_bytes())
+        paths.GOOGLE_ACCOUNTS_PATH.write_text('{"active": "current@example.com"}', encoding="utf-8")
+        self.existing_files = {
+            path: path.read_bytes()
+            for path in (*paths.TOKEN_CANDIDATES, paths.SSH_TOKEN_MIRROR,
+                         paths.GOOGLE_ACCOUNTS_PATH, profile_token)
+        }
+
+    def _login(self, token=None, *, code=0):
+        def launch(argv, env):
+            self.assertEqual(argv[:3], ["C:/bin/agy.exe", "acp", "--login"])
+            flag, target = argv[3].split("=", 1)
+            self.assertEqual(flag, "--gemini_dir")
+            profile = Path(target)
+            self.assertEqual(profile.parent, paths.BACKUP_ROOT)
+            self.assertEqual(list(profile.iterdir()), [])
+            self.assertEqual(env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"], "1")
+            if token is not None:
+                primary, _ = credentials.profile_token_paths(profile)
+                primary.parent.mkdir()
+                primary.write_bytes(token.encode("utf-8") if isinstance(token, str) else token)
+            return code
+
+        with mock.patch.object(cli.sys, "argv", ["agyswap", "login"]), \
+             mock.patch.object(cli, "_agy_executable", return_value="C:/bin/agy.exe"), \
+             mock.patch.object(cli, "_launch_agy", side_effect=launch), \
+             mock.patch.object(credentials, "read_keyring") as read_keyring, \
+             mock.patch.object(credentials, "write_keyring") as write_keyring, \
+             mock.patch.object(cli, "console") as console, \
+             mock.patch.object(cli, "error_console"):
+            try:
+                cli.main()
+            except SystemExit as exc:
+                exit_code = exc.code
+            else:
+                exit_code = 0
+        read_keyring.assert_not_called()
+        write_keyring.assert_not_called()
+        self.assertEqual(list(paths.BACKUP_ROOT.glob("login-*")), [])
+        for path, before in self.existing_files.items():
+            self.assertEqual(path.read_bytes(), before, str(path))
+        return exit_code, console
+
+    def test_login_registers_a_new_runnable_account_without_switching(self):
+        email = "new@example.com"
+        token = make_token(email)
+        exit_code, console = self._login(token)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("agyswap run 2", console.print.call_args.args[0])
+        registry = json.loads(paths.SEQUENCE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(registry["activeEmail"], self.current.email)
+        self.assertEqual(registry["accounts"]["2"]["email"], email)
+        profile = Path(AgySwitcher().prepare_profile("2")["profile"])
+        self.assertEqual(credentials.read_profile_token(profile), token)
+
+    def test_login_again_updates_the_backup_without_adding_an_account(self):
+        email = "new@example.com"
+        token = make_token(email, expiry=time.time() + 3600)
+        newer = make_token(email.upper(), expiry=time.time() + 7200)
+
+        self.assertEqual(self._login(token)[0], 0)
+        self.assertEqual(self._login(newer)[0], 0)
+        self.assertEqual(self._login(token)[0], 0)
+
+        registry = json.loads(paths.SEQUENCE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(registry["sequence"], [1, 2])
+        self.assertEqual(registry["activeEmail"], self.current.email)
+        self.assertEqual(credentials.read_token_backup(2, email), newer)
+
+    def test_failed_login_never_registers_even_if_agy_wrote_a_token(self):
+        registry = paths.SEQUENCE_FILE.read_bytes()
+        self.assertEqual(self._login(make_token("new@example.com"), code=7)[0], 7)
+        self.assertEqual(paths.SEQUENCE_FILE.read_bytes(), registry)
+
+    def test_login_requires_a_token_with_an_identity(self):
+        registry = paths.SEQUENCE_FILE.read_bytes()
+        with mock.patch.object(credentials, "_email_from_userinfo", return_value=None):
+            for token in (None, "invalid token", b"\xff", make_token("")):
+                with self.subTest(token=token):
+                    self.assertEqual(self._login(token)[0], 1)
+                    self.assertEqual(paths.SEQUENCE_FILE.read_bytes(), registry)
 
 
 class AgyExecutableTest(unittest.TestCase):

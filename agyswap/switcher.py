@@ -164,7 +164,9 @@ class AgySwitcher:
                 return account
         return None
 
-    def _save_backup_if_fresher(self, owner: Account, content: str) -> None:
+    def _save_backup_if_fresher(
+        self, owner: Account, content: str, *, required: bool = False
+    ) -> None:
         """Persist ``content`` to ``owner``'s backup without clobbering a newer copy."""
         existing = credentials.read_token_backup(owner.credential_number, owner.email)
         if existing:
@@ -175,7 +177,8 @@ class AgySwitcher:
         try:
             credentials.save_token_backup(owner.credential_number, owner.email, content)
         except OSError:
-            pass
+            if required:
+                raise
 
     def _resolve_account(self, identifier: str) -> Account:
         try:
@@ -461,8 +464,20 @@ class AgySwitcher:
             for source, text in tokens
         ]
 
-    def _register_token(self, token: str, email_override: Optional[str]) -> Account:
+    @_registry_mutation
+    def import_profile_login(self, profile: Path) -> Account:
+        """Register a fresh isolated login without activating it."""
+        token = credentials.read_profile_token(profile)
+        if not token:
+            raise AgyError("The isolated agy login did not produce a usable token.")
+        return self._register_token(token, None, isolated=True)
+
+    def _register_token(
+        self, token: str, email_override: Optional[str], *, isolated: bool = False
+    ) -> Account:
         verified = credentials.email_from_token(token)
+        if isolated and not verified:
+            raise AgyError("Could not determine the email for the isolated agy login.")
 
         # The token's signed identity outranks a typed-in label.  Accepting a
         # mismatching override would create an account whose backup can never
@@ -487,32 +502,30 @@ class AgySwitcher:
             or f"account-{self._next_number()}"
         )
 
-        existing = self._find_account_by_email(email)
-        if existing:
+        account = self._find_account_by_email(email)
+        if account:
             # Only overwrite when the token's identity is confirmed, so a
             # half-finished login can never corrupt a good backup.
-            if verified and existing.email.lower() == verified.lower():
-                self._save_backup_if_fresher(existing, token)
-                existing.updated_at = now_iso()
-                self._seq.active_email = existing.email
-                self._save_sequence()
-                if paths.SSH_TOKEN_MIRROR.exists():
-                    credentials.write_token_mirror(token)
-            return existing
+            if not verified:
+                return account
+            self._save_backup_if_fresher(account, token, required=isolated)
+            account.updated_at = now_iso()
+        else:
+            number = self._next_number()
+            last_backup = max(
+                (entry.credential_number for entry in self._seq.accounts.values()),
+                default=0,
+            )
+            account = Account(number=number, email=email, backup_number=max(number, last_backup + 1))
+            credentials.save_token_backup(account.credential_number, email, token)
+            self._seq.accounts[number] = account
+            if number not in self._seq.sequence:
+                self._seq.sequence.append(number)
 
-        number = self._next_number()
-        last_backup = max(
-            (account.credential_number for account in self._seq.accounts.values()),
-            default=0,
-        )
-        account = Account(number=number, email=email, backup_number=max(number, last_backup + 1))
-        self._seq.accounts[number] = account
-        if number not in self._seq.sequence:
-            self._seq.sequence.append(number)
-        credentials.save_token_backup(account.credential_number, email, token)
-        self._seq.active_email = account.email
+        if not isolated:
+            self._seq.active_email = account.email
         self._save_sequence()
-        if paths.SSH_TOKEN_MIRROR.exists():
+        if not isolated and paths.SSH_TOKEN_MIRROR.exists():
             credentials.write_token_mirror(token)
         return account
 

@@ -421,7 +421,7 @@ def read_profile_token(profile: Path) -> Optional[str]:
     for path in profile_token_paths(profile):
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             continue
         if not looks_like_token(text):
             continue
