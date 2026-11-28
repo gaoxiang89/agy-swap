@@ -5,14 +5,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 from agyswap import __version__, credentials, paths, quota
 from agyswap.switcher import AccountNotFoundError, AgyError, AgySwitcher, current_email
+from agyswap.timeutil import format_duration, parse_iso_ts
 
 from rich.console import Console
+from rich.measure import Measurement
 from rich.table import Table
+from rich.text import Text
 from rich import box
 
 console = Console()
@@ -53,14 +57,85 @@ def _source_label(source: str) -> str:
     return source if source.startswith("keyring:") else Path(source).name
 
 
-def _quota_summary(row: dict) -> str:
-    """One column can only say so much: report the most constrained window."""
+#: Bar widths ``agyswap list`` tries, widest first, until the table fits.
+_BAR_WIDTHS = (10, 6, 0)
+
+
+def _severity_style(pct: float) -> str:
+    if pct >= 90:
+        return "red"
+    if pct >= 70:
+        return "yellow"
+    return "green"
+
+
+def _quota_cell(row: dict, now: Optional[float] = None, bar_width: int = _BAR_WIDTHS[0]) -> Text:
+    """Every window on its own line: bar, used %, and time until reset."""
+    now = time.time() if now is None else now
     windows = row.get("quota_windows") or []
     if not windows:
         status = row.get("quota_status") or "unknown"
-        return "—" if status in ("unknown", "") else status
-    worst = max(windows, key=lambda window: window["used_pct"])
-    return f"{worst['label']} {worst['used_pct']:.0f}%"
+        detail = "no samples yet" if status in ("unknown", "") else status
+        return Text(detail, style="dim")
+
+    fetched_at = row.get("quota_fetched_at")
+    age = now - float(fetched_at) if fetched_at else None
+    stale = age is not None and age > quota.STALE_OK_S
+    label_width = max(len(window["label"]) for window in windows)
+
+    cell = Text()
+    for index, window in enumerate(windows):
+        if index:
+            cell.append("\n")
+        pct = float(window["used_pct"])
+        color = _severity_style(pct)
+        if stale:
+            color += " dim"
+        cell.append(f"{window['label']:<{label_width}} ", style="dim" if stale else "")
+        if bar_width:
+            filled = round(min(max(pct, 0.0), 100.0) / 100.0 * bar_width)
+            cell.append("━" * filled, style=color)
+            cell.append("─" * (bar_width - filled), style="bright_black")
+            cell.append(" ")
+        cell.append(f"{pct:3.0f}%", style=color)
+        resets = parse_iso_ts(window.get("resets_at"))
+        if resets is not None:
+            left = resets - now
+            if left > 0:
+                cell.append(f" ↻ {format_duration(left)}", style="dim")
+            elif pct > 0:
+                # The window rolled over after this sample, so the % above is outdated.
+                cell.append(" ↻ reset since sample", style="dim")
+    if age is not None and age > 0:
+        cell.append(f"\nupdated {format_duration(age)} ago", style="yellow dim" if stale else "dim")
+    return cell
+
+
+def _accounts_table(rows: list[dict], bar_width: int, now: float) -> Table:
+    table = Table(box=box.ROUNDED, show_lines=True)
+    table.add_column("#", style="bold")
+    table.add_column("Email")
+    show_alias = any(row["alias"] for row in rows)
+    if show_alias:
+        table.add_column("Alias")
+    table.add_column("Status")
+    table.add_column("Token")
+    table.add_column("Quota", no_wrap=True)
+
+    for row in rows:
+        status_parts = []
+        if row["active"]:
+            status_parts.append("[green]active[/green]")
+        if row["disabled"]:
+            status_parts.append("[yellow]disabled[/yellow]")
+        status = " ".join(status_parts) if status_parts else "[dim]—[/dim]"
+        token = "[green]✓[/green]" if row["has_token"] else "[red]✗[/red]"
+        cells = [str(row["number"]), row["email"]]
+        if show_alias:
+            cells.append(row["alias"] or "")
+        cells += [status, token, _quota_cell(row, now, bar_width)]
+        table.add_row(*cells)
+    return table
 
 
 def cmd_list(sw: AgySwitcher, args) -> None:
@@ -73,33 +148,14 @@ def cmd_list(sw: AgySwitcher, args) -> None:
         )
         return
 
-    table = Table(box=box.ROUNDED)
-    table.add_column("#", style="bold")
-    table.add_column("Email")
-    table.add_column("Alias")
-    table.add_column("Status")
-    table.add_column("Token")
-    table.add_column("Quota")
-
-    for row in rows:
-        status_parts = []
-        if row["active"]:
-            status_parts.append("[green]active[/green]")
-        if row["disabled"]:
-            status_parts.append("[yellow]disabled[/yellow]")
-        status = " ".join(status_parts) if status_parts else "[dim]—[/dim]"
-        token = "[green]✓[/green]" if row["has_token"] else "[red]✗[/red]"
-        table.add_row(
-            str(row["number"]),
-            row["email"],
-            row["alias"] or "",
-            status,
-            token,
-            _quota_summary(row),
-        )
-
+    now = time.time()
+    for bar_width in _BAR_WIDTHS:
+        table = _accounts_table(rows, bar_width, now)
+        # Measure unconstrained: console.options would cap it at the terminal width.
+        natural = Measurement.get(console, console.options.update_width(10_000), table)
+        if natural.maximum <= console.width:
+            break
     console.print(table)
-
 
 def cmd_status(sw: AgySwitcher, args) -> None:
     info = sw.status()

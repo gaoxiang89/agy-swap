@@ -18,6 +18,7 @@ from tests import bootstrap  # noqa: F401 - isolate paths before importing agysw
 from agyswap import cli, credentials, paths, statusline  # noqa: E402
 from agyswap.cli import _agy_executable, cmd_run, cmd_sync, platform_label  # noqa: E402
 from agyswap.switcher import AgySwitcher  # noqa: E402
+from agyswap.timeutil import iso_from_ts  # noqa: E402
 from tests.test_credentials import make_token  # noqa: E402
 
 
@@ -55,6 +56,83 @@ class PlatformLabelTest(unittest.TestCase):
                 platform_label(), "Linux 6.6.87.2-microsoft-standard-WSL2"
             )
 
+
+class QuotaCellTest(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    def _row(self, windows, fetched_ago=30.0):
+        return {
+            "quota_windows": windows,
+            "quota_status": "ok" if windows else "unknown",
+            "quota_fetched_at": self.NOW - fetched_ago if fetched_ago is not None else None,
+        }
+
+    def _window(self, label, pct, reset_in):
+        resets = "" if reset_in is None else iso_from_ts(self.NOW + reset_in)
+        return {"key": label, "label": label, "used_pct": pct, "resets_at": resets}
+
+    def test_every_window_gets_a_line_with_bar_pct_and_reset(self):
+        cell = cli._quota_cell(
+            self._row([self._window("gemini 5h", 47, 3600 + 17 * 60),
+                       self._window("gemini 7d", 28, 4 * 86400)]),
+            now=self.NOW,
+        ).plain.splitlines()
+        self.assertEqual(len(cell), 3)
+        self.assertTrue(cell[0].startswith("gemini 5h ━━━━━─────  47%"))
+        self.assertIn("↻ 1h 17m", cell[0])
+        self.assertIn("28%", cell[1])
+        self.assertIn("↻ 4d", cell[1])
+        self.assertEqual(cell[2], "updated 30s ago")
+
+    def test_labels_are_aligned(self):
+        lines = cli._quota_cell(
+            self._row([self._window("3p 5h", 0, None), self._window("gemini 7d", 50, None)]),
+            now=self.NOW,
+        ).plain.splitlines()
+        self.assertEqual(lines[0].index("─"), lines[1].index("━"))
+
+    def test_bar_can_be_dropped_for_narrow_terminals(self):
+        line = cli._quota_cell(
+            self._row([self._window("gemini 5h", 47, 600)]), now=self.NOW, bar_width=0
+        ).plain.splitlines()[0]
+        self.assertEqual(line, "gemini 5h  47% ↻ 10m")
+
+    def test_list_fits_the_terminal_width(self):
+        from rich.console import Console
+
+        rows = [{
+            "number": 1, "email": "someone.long@example.com", "alias": "", "active": True,
+            "disabled": False, "has_token": True,
+            **self._row([self._window("gemini 5h", 47, 3600), self._window("argon 7d", 3, 86400)]),
+        }]
+        for width in (80, 120):
+            with self.subTest(width=width):
+                out = Console(width=width, file=StringIO(), color_system=None)
+                with mock.patch.object(cli, "console", out), \
+                     mock.patch.object(cli.time, "time", return_value=self.NOW):
+                    cli.cmd_list(mock.Mock(list_accounts=mock.Mock(return_value=rows)), None)
+                printed = out.file.getvalue().splitlines()
+                self.assertTrue(all(len(line) <= width for line in printed))
+                self.assertTrue(any("47%" in line and "↻ 1h" in line for line in printed))
+                self.assertTrue(any("someone.long@example.com" in line for line in printed))
+
+    def test_past_reset_is_hidden_for_unused_window_but_flagged_when_used(self):
+        lines = cli._quota_cell(
+            self._row([self._window("3p 5h", 0, -60), self._window("gemini 5h", 40, -60)]),
+            now=self.NOW,
+        ).plain.splitlines()
+        self.assertNotIn("↻", lines[0])
+        self.assertIn("↻ reset since sample", lines[1])
+
+    def test_stale_sample_is_dimmed(self):
+        cell = cli._quota_cell(
+            self._row([self._window("gemini 5h", 95, None)], fetched_ago=3600), now=self.NOW
+        )
+        self.assertTrue(any("dim" in str(span.style) for span in cell.spans))
+        self.assertIn("updated 1h ago", cell.plain)
+
+    def test_no_samples(self):
+        self.assertEqual(cli._quota_cell(self._row([], None), now=self.NOW).plain, "no samples yet")
 
 class LauncherTest(unittest.TestCase):
     """The launcher is what makes quoting irrelevant in agy's settings.
