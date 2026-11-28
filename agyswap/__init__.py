@@ -4,8 +4,8 @@ try:  # keep the reported version in lock-step with the installed distribution
     try:
         __version__ = _dist_version("agy-swap")
     except PackageNotFoundError:  # running from a source checkout
-        __version__ = "0.2.1"
+        __version__ = "0.3.0"
 except Exception:  # pragma: no cover - very old interpreters
-    __version__ = "0.2.1"
+    __version__ = "0.3.0"
 
 __all__ = ["__version__"]
