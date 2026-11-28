@@ -15,6 +15,12 @@ ROOT = Path(tempfile.mkdtemp(prefix="agyswap-tests-"))
 os.environ["AGYSWAP_DATA_DIR"] = str(ROOT / "data")
 os.environ["AGY_GEMINI_DIR"] = str(ROOT / "gemini")
 
+# A developer shell that forces file-only mode would otherwise disable every
+# keyring code path the suite is meant to exercise.  Tests that want that mode
+# set the variable explicitly.
+for _name in ("AGYSWAP_DISABLE_KEYRING", "AGY_CLI_FORCE_FILE_TOKEN_STORAGE"):
+    os.environ.pop(_name, None)
+
 #: Do not litter /tmp (or %TEMP%) with one directory per test run.
 atexit.register(shutil.rmtree, ROOT, ignore_errors=True)
 

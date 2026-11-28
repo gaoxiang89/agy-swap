@@ -1,7 +1,11 @@
 import argparse
+import os
 import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 from agyswap import __version__, credentials, paths, quota
 from agyswap.switcher import AccountNotFoundError, AgyError, AgySwitcher, current_email
@@ -11,6 +15,9 @@ from rich.table import Table
 from rich import box
 
 console = Console()
+error_console = Console(stderr=True)
+
+_AGY_PROFILE_FLAGS = {"gemini_dir", "app_data_dir", "cli_dir_name"}
 
 
 def platform_label() -> str:
@@ -130,6 +137,97 @@ def cmd_sync(sw: AgySwitcher, args) -> None:
     for target in result["targets"]:
         console.print(f"  {target}")
     console.print("[dim]Restart agy for the token to take effect.[/dim]")
+
+
+def _agy_executable() -> Optional[str]:
+    """Locate agy without assuming where the install put it."""
+    override = os.environ.get("AGY_EXE")
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+        found = shutil.which(override)
+        if found:
+            return found
+
+    found = shutil.which("agy")
+    if found:
+        return found
+
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(Path(local) / "agy" / "bin" / "agy.exe")
+    candidates.extend(
+        [
+            Path.home() / ".local" / "bin" / "agy",
+            Path("/usr/local/bin/agy"),
+            Path("/opt/homebrew/bin/agy"),
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _launch_agy(argv: list[str], env: dict) -> int:
+    """Start agy and return its exit status (kept separate for testing)."""
+    return subprocess.run(argv, env=env).returncode
+
+
+def cmd_run(sw: AgySwitcher, args) -> None:
+    """Launch agy with one account's private Gemini root."""
+    agy_args = list(args.agy_args or [])
+    for arg in agy_args:
+        flag = arg.partition("=")[0]
+        name = flag.lstrip("-").replace("-", "_")
+        if flag.startswith("-") and name in _AGY_PROFILE_FLAGS:
+            error_console.print(f"[red]Error:[/red] agyswap run manages {flag}.")
+            sys.exit(1)
+
+    executable = _agy_executable()
+    if not executable:
+        error_console.print(
+            "[red]Error:[/red] cannot find agy. Install Antigravity CLI or set "
+            "[bold]AGY_EXE[/bold] to its executable."
+        )
+        sys.exit(1)
+
+    try:
+        info = sw.prepare_profile(args.identifier)
+    except AgyError as exc:
+        error_console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+
+    profile = Path(info["profile"])
+    env = os.environ.copy()
+    # The OS keyring has one global slot (gemini:antigravity) and is not
+    # namespaced by --gemini_dir, so file storage is what makes the profile
+    # independent.  Set it here instead of relying on the caller's shell.
+    env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] = "1"
+    # Statusline quota capture runs as a child of agy; this tells it which
+    # account the samples belong to even when the payload omits an email.
+    env["AGYSWAP_PROFILE_EMAIL"] = info["email"]
+    env["AGYSWAP_DATA_DIR"] = str(paths.BACKUP_ROOT)
+
+    argv = [executable, f"--gemini_dir={profile}", *agy_args]
+    error_console.print(f"Running agy with profile for {info['email']}", markup=False)
+    error_console.print(str(profile), style="dim", markup=False, soft_wrap=True)
+
+    code = 1
+    try:
+        code = _launch_agy(argv, env)
+    except OSError as exc:
+        error_console.print(f"[red]Error:[/red] could not start agy: {exc}")
+    finally:
+        try:
+            sw.capture_profile(info["email"], profile)
+        except Exception:
+            # A failed capture must never hide agy's own exit status.
+            pass
+    sys.exit(code)
 
 
 def cmd_add(sw: AgySwitcher, args) -> None:
@@ -360,6 +458,17 @@ def cmd_doctor(sw: AgySwitcher, args) -> None:
     accounts = sw.list_accounts()
     table.add_row("accounts", str(len(accounts)) if accounts else "[dim]none[/dim]")
 
+    profiles = (
+        sorted(p for p in paths.PROFILES_DIR.glob("*/gemini") if p.is_dir())
+        if paths.PROFILES_DIR.exists()
+        else []
+    )
+    if profiles:
+        table.add_row(
+            "profiles",
+            f"{len(profiles)} isolated · {paths.PROFILES_DIR}",
+        )
+
     orphans = sw.orphan_backups()
     if orphans:
         table.add_row(
@@ -537,6 +646,8 @@ def main() -> None:
   agyswap switch           rotate to next enabled account
   agyswap switch 2         switch to account #2
   agyswap switch email     switch to account by email
+  agyswap run 2            run agy with #2's isolated credential profile
+  agyswap run 2 --print hi pass agy options after the id
   agyswap sync             restore the token file agy uses over SSH
   agyswap sync --if-missing  only when agy's token file is missing
   agyswap disable 2        hold an account out of rotation
@@ -567,6 +678,17 @@ def main() -> None:
 
     p_switch = sub.add_parser("switch", help="switch accounts")
     p_switch.add_argument("identifier", nargs="?", help="account number, email, or alias")
+
+    p_run = sub.add_parser(
+        "run",
+        help="run agy with an isolated credential profile for one account",
+    )
+    p_run.add_argument("identifier", help="account number, email, or alias")
+    p_run.add_argument(
+        "agy_args",
+        nargs=argparse.REMAINDER,
+        help="arguments passed through to agy (profile directory flags are reserved)",
+    )
 
     p_sync = sub.add_parser(
         "sync", help="write the active token to agy's file store (SSH sessions)"
@@ -623,6 +745,7 @@ def main() -> None:
         "add": cmd_add,
         "recover": cmd_recover,
         "switch": cmd_switch,
+        "run": cmd_run,
         "sync": cmd_sync,
         "remove": cmd_remove,
         "rm": cmd_remove,

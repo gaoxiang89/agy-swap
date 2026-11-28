@@ -50,10 +50,12 @@ Schema 2 on disk::
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Optional
 
 from agyswap import credentials, paths
+from agyswap.locking import exclusive_file_lock
 
 SCHEMA = 2
 
@@ -308,28 +310,35 @@ def statusline_capture(data: dict) -> Optional[str]:
 
     email = data.get("email")
     if not isinstance(email, str) or "@" not in email:
+        # ``agyswap run`` sets this for the agy process it launches.  The
+        # statusline hook inherits it, so samples from an isolated profile are
+        # filed under the account that produced them even when agy's payload
+        # has no email field.
+        email = os.environ.get("AGYSWAP_PROFILE_EMAIL")
+    if not isinstance(email, str) or "@" not in email:
         token, _ = credentials.read_token()
         email = credentials.email_from_token(token) if token else None
     if not isinstance(email, str) or "@" not in email:
         return None
 
-    cache = load_cache()
-    accounts = cache.setdefault("accounts", {})
-    entry = accounts.get(email)
-    if not isinstance(entry, dict):
-        entry = {}
-    accounts[email] = entry
+    with exclusive_file_lock(paths.QUOTA_CACHE.with_suffix(".lock")):
+        cache = load_cache()
+        accounts = cache.setdefault("accounts", {})
+        entry = accounts.get(email)
+        if not isinstance(entry, dict):
+            entry = {}
+        accounts[email] = entry
 
-    now = time.time()
-    existing = entry.get("windows") if isinstance(entry.get("windows"), dict) else {}
-    last_seen = _num((entry.get("sources") or {}).get("statusline")) or 0.0
-    if existing == mapped["windows"] and now - last_seen < CAPTURE_THROTTLE_S:
-        return email
+        now = time.time()
+        existing = entry.get("windows") if isinstance(entry.get("windows"), dict) else {}
+        last_seen = _num((entry.get("sources") or {}).get("statusline")) or 0.0
+        if existing == mapped["windows"] and now - last_seen < CAPTURE_THROTTLE_S:
+            return email
 
-    entry["windows"] = {**existing, **mapped["windows"]}
-    entry["captured_at"] = now
-    entry.setdefault("sources", {})["statusline"] = now
-    save_cache(cache)
+        entry["windows"] = {**existing, **mapped["windows"]}
+        entry["captured_at"] = now
+        entry.setdefault("sources", {})["statusline"] = now
+        save_cache(cache)
     return email
 
 

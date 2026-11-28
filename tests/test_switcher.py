@@ -1,6 +1,7 @@
 import json
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests import bootstrap
@@ -565,6 +566,189 @@ class RemoveTest(SwitcherTestCase):
         result = switcher.sync()
         self.assertEqual(result["source"], "backup:bob@example.com")
         self.assertEqual(result["email"], "bob@example.com")
+
+class ProfileTest(SwitcherTestCase):
+    """``agyswap run`` must isolate one account without touching the shared slot."""
+
+    def _add(self, email, **kwargs):
+        self.set_live_token(email, **kwargs)
+        account = AgySwitcher().add_current()
+        return account
+
+    @staticmethod
+    def _profile_token(profile):
+        return Path(profile) / paths.APP_DATA_DIR_NAME / "antigravity-oauth-token"
+
+    def test_prepare_writes_only_inside_the_profile(self):
+        account = self._add("profile@example.com", expiry=time.time() + 3600)
+        shared_before = paths.TOKEN_PATH.read_text(encoding="utf-8")
+
+        info = AgySwitcher().prepare_profile(str(account.number))
+
+        profile = Path(info["profile"])
+        self.assertEqual(profile, paths.profile_gemini_dir(account.email))
+        token_file = self._profile_token(profile)
+        self.assertTrue(token_file.is_file())
+        self.assertEqual(
+            credentials.email_from_token(
+                token_file.read_text(encoding="utf-8"), allow_network=False
+            ),
+            account.email,
+        )
+        self.assertEqual(paths.TOKEN_PATH.read_text(encoding="utf-8"), shared_before)
+        self.assertFalse(paths.SSH_TOKEN_MIRROR.exists())
+
+    def test_two_profiles_keep_separate_tokens(self):
+        first = self._add("first@example.com", expiry=time.time() + 3600)
+        second = self._add("second@example.com", expiry=time.time() + 3600)
+        sw = AgySwitcher()
+        first_dir = Path(sw.prepare_profile("1")["profile"])
+        second_dir = Path(sw.prepare_profile("2")["profile"])
+
+        newer_first = make_token("first@example.com", expiry=time.time() + 7200)
+        newer_second = make_token("second@example.com", expiry=time.time() + 5400)
+        self._profile_token(first_dir).write_text(newer_first, encoding="utf-8")
+        self._profile_token(second_dir).write_text(newer_second, encoding="utf-8")
+
+        sw.capture_profile(first.email, first_dir)
+        sw.capture_profile(second.email, second_dir)
+
+        backup_first = credentials.read_token_backup(
+            first.credential_number, first.email
+        )
+        backup_second = credentials.read_token_backup(
+            second.credential_number, second.email
+        )
+        self.assertEqual(
+            credentials.email_from_token(backup_first, allow_network=False),
+            "first@example.com",
+        )
+        self.assertEqual(
+            credentials.email_from_token(backup_second, allow_network=False),
+            "second@example.com",
+        )
+        self.assertGreater(
+            credentials.token_expiry(backup_first), time.time() + 7000
+        )
+        self.assertGreater(
+            credentials.token_expiry(backup_second), time.time() + 5000
+        )
+
+    def test_prepare_folds_in_a_refresh_left_by_the_previous_run(self):
+        account = self._add("fresh@example.com", expiry=time.time() + 3600)
+        sw = AgySwitcher()
+        profile = Path(sw.prepare_profile("1")["profile"])
+
+        refreshed = make_token("fresh@example.com", expiry=time.time() + 7200)
+        self._profile_token(profile).write_text(refreshed, encoding="utf-8")
+
+        sw.prepare_profile("1")
+        backup = credentials.read_token_backup(
+            account.credential_number, account.email
+        )
+        self.assertGreater(credentials.token_expiry(backup), time.time() + 7000)
+
+    def test_email_punctuation_cannot_make_two_accounts_share_a_profile(self):
+        first = self._add("first.last@example.com")
+        second = self._add("first_dot_last@example.com")
+        sw = AgySwitcher()
+        first_dir = Path(sw.prepare_profile(str(first.number))["profile"])
+        second_dir = Path(sw.prepare_profile(str(second.number))["profile"])
+
+        self.assertNotEqual(first_dir, second_dir)
+        self.assertEqual(second_dir, paths.profile_gemini_dir(second.email.upper()))
+        sw.remove_account(str(first.number))
+        self.assertEqual(
+            credentials.email_from_token(
+                self._profile_token(second_dir).read_text(encoding="utf-8"),
+                allow_network=False,
+            ),
+            second.email,
+        )
+
+    def test_primary_token_write_failure_prevents_profile_preparation(self):
+        account = self._add("owner@example.com")
+        sw = AgySwitcher()
+        profile = sw.profile_dir(str(account.number))
+        primary, compatibility = credentials.profile_token_paths(profile)
+        original_write = credentials.atomic_write
+
+        def fail_primary(path, *args, **kwargs):
+            if path == primary:
+                raise PermissionError("primary file is unwritable")
+            return original_write(path, *args, **kwargs)
+
+        with mock.patch.object(credentials, "atomic_write", side_effect=fail_primary):
+            with self.assertRaisesRegex(AgyError, "Could not write the isolated token"):
+                sw.prepare_profile(str(account.number))
+        self.assertFalse(compatibility.exists())
+
+    def test_capture_ignores_a_profile_token_for_another_account(self):
+        account = self._add("owner@example.com", expiry=time.time() + 3600)
+        sw = AgySwitcher()
+        profile = Path(sw.prepare_profile("1")["profile"])
+
+        self._profile_token(profile).write_text(
+            make_token("intruder@example.com", expiry=time.time() + 7200),
+            encoding="utf-8",
+        )
+        result = sw.capture_profile(account.email, profile)
+
+        self.assertFalse(result["captured"])
+        backup = credentials.read_token_backup(
+            account.credential_number, account.email
+        )
+        self.assertEqual(
+            credentials.email_from_token(backup, allow_network=False),
+            "owner@example.com",
+        )
+
+    def test_settings_are_seeded_once_and_never_overwritten(self):
+        account = self._add("settings@example.com", expiry=time.time() + 3600)
+        source = paths.AGY_CLI_DIR / "settings.json"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text('{"model": "one"}', encoding="utf-8")
+
+        sw = AgySwitcher()
+        profile = Path(sw.prepare_profile(str(account.number))["profile"])
+        target = profile / paths.APP_DATA_DIR_NAME / "settings.json"
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"model": "one"}')
+
+        source.write_text('{"model": "two"}', encoding="utf-8")
+        sw.prepare_profile(str(account.number))
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"model": "one"}')
+
+    def test_remove_clears_the_token_but_keeps_profile_history(self):
+        account = self._add("cleanup@example.com", expiry=time.time() + 3600)
+        sw = AgySwitcher()
+        profile = Path(sw.prepare_profile(str(account.number))["profile"])
+        history = profile / "antigravity-cli" / "conversations" / "chat.json"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_text("kept", encoding="utf-8")
+
+        sw.remove_account(str(account.number))
+
+        self.assertFalse(self._profile_token(profile).exists())
+        self.assertEqual(history.read_text(encoding="utf-8"), "kept")
+
+    def test_renumbering_does_not_move_a_profile(self):
+        self._add("one@example.com", expiry=time.time() + 3600)
+        self._add("two@example.com", expiry=time.time() + 3600)
+        sw = AgySwitcher()
+        before = Path(sw.prepare_profile("2")["profile"])
+
+        sw.remove_account("1")
+
+        after = Path(sw.prepare_profile("1")["profile"])
+        self.assertEqual(before, after)
+        self.assertEqual(
+            credentials.email_from_token(
+                self._profile_token(after).read_text(encoding="utf-8"),
+                allow_network=False,
+            ),
+            "two@example.com",
+        )
+
 
 class LegacyIdentityTest(SwitcherTestCase):
     def test_falls_back_to_google_accounts(self):

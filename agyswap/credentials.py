@@ -397,6 +397,104 @@ def delete_token_backup(number: int, email: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# isolated profiles (``agyswap run``)
+# ---------------------------------------------------------------------------
+
+
+def profile_token_paths(profile: Path) -> tuple[Path, Path]:
+    """The primary and compatibility token paths in a profile."""
+    return (
+        profile / paths.APP_DATA_DIR_NAME / "antigravity-oauth-token",
+        profile / "jetski-standalone-oauth-token",
+    )
+
+
+def read_profile_token(profile: Path) -> Optional[str]:
+    """Freshest token in ``profile``, normalized for agy 1.5.x.
+
+    Returns ``None`` when the profile has never run, when every file is
+    unreadable, or when the contents do not look like a token.
+    """
+    best: Optional[str] = None
+    best_score = (float("-inf"), float("-inf"))
+    for path in profile_token_paths(profile):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not looks_like_token(text):
+            continue
+        document = ensure_token_document(text)
+        if document is None:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        score = (token_expiry(document) or 0.0, mtime)
+        if score > best_score:
+            best, best_score = document, score
+    return best
+
+
+def delete_profile_token(profile: Path) -> None:
+    """Remove a profile's token files, leaving its history and settings."""
+    for path in profile_token_paths(profile):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def write_profile_token(profile: Path, content: str) -> list[str]:
+    """Write ``content`` into a profile's own token files.
+
+    Propagate failures writing agy's primary file. The compatibility copy is
+    best effort. Return the paths successfully written.
+    """
+    document = ensure_token_document(content)
+    if document is None:
+        return []
+    primary, compatibility = profile_token_paths(profile)
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    secure_dir(primary.parent)
+    atomic_write(primary, document, secure=True)
+    written = [str(primary)]
+    try:
+        atomic_write(compatibility, document, secure=True)
+        written.append(str(compatibility))
+    except OSError:
+        pass
+    return written
+
+
+def seed_profile_config(profile: Path) -> list[str]:
+    """Give a new profile the current CLI settings, once.
+
+    Only ``settings.json`` is copied.  Anything else (history, plugins, MCP
+    state) belongs to the profile and should not leak between accounts.  An
+    existing profile settings file is never overwritten, so changes made
+    inside a profile survive later ``agyswap run`` calls.
+    """
+    seeded: list[str] = []
+    target = profile / paths.APP_DATA_DIR_NAME / "settings.json"
+    if target.exists():
+        return seeded
+    source = paths.AGY_CLI_DIR / "settings.json"
+    if not source.is_file():
+        return seeded
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        secure_dir(target.parent)
+        shutil.copy2(source, target)
+        secure_file(target)
+        seeded.append(str(target))
+    except OSError:
+        pass
+    return seeded
+
+
 def email_from_backup_slug(slug: str) -> Optional[str]:
     """Best-effort reverse of the file-name sanitising in :func:`backup_path`."""
     if "_at_" not in slug:

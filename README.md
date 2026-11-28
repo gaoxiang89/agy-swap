@@ -117,6 +117,8 @@ agyswap switch                 # rotate to the next enabled account
 agyswap switch 2               # by slot number
 agyswap switch user@gmail.com  # by email
 agyswap switch work            # by alias
+agyswap run 2                  # launch agy with #2's isolated credentials
+agyswap run work --print "hi"  # pass arguments through to agy
 agyswap sync                   # restore the token file agy uses over SSH
 agyswap disable 2              # hold out of rotation (keeps credentials)
 agyswap enable 2
@@ -141,6 +143,60 @@ Removing accounts closes gaps in the remaining slot numbers while preserving rot
 | `f` | Refresh now |
 | `j` / `k` | Move |
 | `q` | Back / quit |
+
+### Isolated profiles (`agyswap run`)
+
+`agyswap switch` keeps the historical single-slot model: it rewrites the one
+token that the next plain `agy` will read. That remains the default and is
+unchanged.
+
+When several accounts must stay online at the same time, `agyswap run` gives
+one account a private Gemini root and launches agy against it:
+
+```bash
+agyswap run 2                  # interactive session as account #2
+agyswap run 2 --print "hello"  # pass agy options after the id
+agyswap run work --model ...   # aliases work too
+```
+
+What a profile contains:
+
+```text
+~/.agy-swap/profiles/<account-hash>/gemini/
+  antigravity-cli/antigravity-oauth-token   <- this account's token
+  antigravity-cli/settings.json             <- copied once from the default root
+  antigravity-cli/...                        <- history, plugins, logs
+```
+
+agy is launched as `agy --gemini_dir=<profile>` and with
+`AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`. Both parts matter:
+
+- `--gemini_dir` is agy's hidden global switch for the Gemini root. It is not
+  `AGY_GEMINI_DIR`, which only changes agy-swap's view and is ignored by agy.
+- The OS keyring has a single global target (`gemini:antigravity`) that is not
+  namespaced by config directory. Forcing file storage is what keeps profiles
+  from sharing it.
+
+Because each profile has its own token file, an agy process refreshing an
+account in the background can no longer overwrite the account another profile
+uses. The shared `~/.gemini` slot is left alone, so plain `agy` behaves exactly
+as before.
+
+Notes:
+
+- Each profile has its own conversation history, plugins and settings.
+  `settings.json` is seeded once from the default root; later changes stay in
+  that profile.
+- The `--gemini_dir` flag is hidden and verified against agy 1.5.19. Check
+  `agy acp --help | grep gemini` after an agy upgrade.
+- Set `AGY_EXE` if agy is installed somewhere `PATH` does not cover.
+- Refreshed tokens are copied back into `~/.agy-swap/credentials/` when the
+  session exits, so the existing backup and `switch` workflow stays current.
+- The profile directory uses a hash of the account email and stays in place
+  when slots are renumbered. Removing an account deletes its profile token
+  and keeps its history and settings.
+- `agyswap run` reserves agy's `gemini_dir`, `app_data_dir` and `cli_dir_name`
+  flags. Launcher messages go to stderr so stdout carries agy's output.
 
 ## Platform support
 
@@ -231,6 +287,10 @@ account its usage stays visible after you switch away.
 - **Switching does not affect a running agy session.** agy reads its token at
   startup and caches it in memory. Exit the session (or open a new terminal) for
   the change to take effect.
+- **`agyswap run` profiles do not share history or plugins.** Each profile is a
+  separate Gemini root; only `settings.json` is seeded from the default root.
+  Use `agyswap run` for concurrent sessions, and plain `agy` when one account
+  at a time is enough.
 - **A desktop agy can delete the SSH token file.** agy 1.5.x removes the file
   when it refreshes a keyring token from a non-SSH session. Run
   `agyswap sync --if-missing` before starting agy over SSH to restore it; see
@@ -250,6 +310,9 @@ account its usage stays visible after you switch away.
 - Switching rewrites the live token in **every** store agy might read: the OS
   keyring, both token files, and agy-swap's SSH mirror, so they can never drift
   apart
+- `agyswap run` gives one account its own Gemini root and launches agy with
+  `--gemini_dir` plus file-only token storage, so concurrent sessions cannot
+  overwrite each other; refreshed tokens are folded back into the backups
 - Account identity is read from the token itself — the signed `id_token` JWT in
   the file, the `id_token_email` field some agy builds write to the Credential
   Manager, or Google's `userinfo` endpoint when a store keeps neither — so it
@@ -270,6 +333,7 @@ platform, and on Windows the keyring is also unusable at the OS level there
 | SSH mirror (agy-swap) | `~/.agy-swap/ssh-token.json` |
 | Legacy account pointer | `~/.gemini/google_accounts.json` (only `active` is touched) |
 | Credential backups | `~/.agy-swap/credentials/` |
+| Isolated profiles | `~/.agy-swap/profiles/<account-hash>/gemini/` |
 | Account registry | `~/.agy-swap/sequence.json` |
 | Quota cache | `~/.agy-swap/cache/quota.json` |
 
@@ -315,9 +379,11 @@ the current session, the file's state, and whether the mirror exists.
 
 | Variable | Effect |
 |---|---|
-| `AGY_GEMINI_DIR` | agy's config root (default `~/.gemini`) |
+| `AGY_GEMINI_DIR` | agy-swap's view of agy's config root (default `~/.gemini`). agy itself ignores this; use agy's `--gemini_dir` flag to move agy. |
 | `AGYSWAP_DATA_DIR` | agy-swap's data root (default `~/.agy-swap`) |
 | `AGYSWAP_DISABLE_KEYRING` | `1` forces the file-only credential path |
+| `AGY_EXE` | agy executable used by `agyswap run` (default: `PATH`) |
+| `AGYSWAP_PROFILE_EMAIL` | set automatically by `agyswap run` for quota attribution |
 
 ## Development
 

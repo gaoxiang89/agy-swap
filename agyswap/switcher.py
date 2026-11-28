@@ -8,12 +8,13 @@ macOS (Keychain), Windows (Credential Manager) and Linux (Secret Service).
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import replace
 from functools import wraps
+from pathlib import Path
 from typing import Optional
 
 from agyswap import credentials, paths, quota
+from agyswap.locking import exclusive_file_lock
 from agyswap.models import Account, SequenceData, now_iso
 
 
@@ -28,18 +29,7 @@ class AccountNotFoundError(AgyError):
 def _registry_mutation(method):
     @wraps(method)
     def update(self, *args, **kwargs):
-        lock_path = paths.BACKUP_ROOT / ".sequence.lock"
-        with lock_path.open("a+b") as lock:
-            if os.name == "nt":
-                import msvcrt
-
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock, fcntl.LOCK_EX)
-            # Closing the handle releases the lock on either platform.
+        with exclusive_file_lock(paths.BACKUP_ROOT / ".sequence.lock"):
             self.reload()
             return method(self, *args, **kwargs)
 
@@ -334,6 +324,104 @@ class AgySwitcher:
             "targets": written,
         }
 
+    # -- isolated profiles ------------------------------------------------
+
+    def profile_dir(self, identifier: str) -> Path:
+        """Gemini root ``agyswap run`` will pass to agy for this account."""
+        account = self._resolve_account(identifier)
+        return paths.profile_gemini_dir(account.email)
+
+    def _capture_profile_token(self, account: Account, profile: Path) -> Optional[str]:
+        """Fold a profile's refreshed token into the account backup.
+
+        The profile file is authoritative while an isolated session runs, so it
+        may be newer than the backup.  A token that belongs to a different
+        account is ignored rather than written into the wrong slot.
+        """
+        token = credentials.read_profile_token(profile)
+        if not token:
+            return None
+        email = credentials.email_from_token(token, allow_network=False)
+        if email and email.lower() != account.email.lower():
+            return None
+        self._save_backup_if_fresher(account, token)
+        return token
+
+    @_registry_mutation
+    def prepare_profile(self, identifier: str) -> dict:
+        """Materialize one account's token into its own Gemini root.
+
+        This deliberately does **not** touch the shared keyring or the default
+        ``~/.gemini`` files: plain ``agy`` keeps using exactly what it used
+        before, while ``agyswap run`` gets a private credential store.
+        """
+        account = self._resolve_account(identifier)
+        profile = paths.profile_gemini_dir(account.email)
+
+        # Capture a refresh from an earlier run that exited before we could.
+        self._capture_profile_token(account, profile)
+
+        token = credentials.read_token_backup(account.credential_number, account.email)
+        if not token:
+            raise AgyError(
+                f"No stored token for {account.email}. "
+                f"Log in with agy and run 'agyswap add' first."
+            )
+
+        expected = credentials.email_from_token(token, allow_network=False)
+        if expected and expected.lower() != account.email.lower():
+            raise AgyError(
+                f"Stored token for {account.email} actually belongs to {expected}. "
+                f"Log in to {account.email} in agy and run 'agyswap add' to fix."
+            )
+
+        try:
+            profile.mkdir(parents=True, exist_ok=True)
+            credentials.secure_dir(profile)
+            written = credentials.write_profile_token(profile, token)
+        except OSError as exc:
+            raise AgyError(
+                f"Could not write the isolated token for {account.email}: {exc}"
+            ) from exc
+        if not written:
+            raise AgyError(f"Could not write the isolated token for {account.email}.")
+
+        seeded = credentials.seed_profile_config(profile)
+        return {
+            "number": account.number,
+            "email": account.email,
+            "profile": str(profile),
+            "targets": written,
+            "seeded": seeded,
+        }
+
+    @_registry_mutation
+    def capture_profile(self, email: str, profile: Path) -> dict:
+        """Save the token from the account and directory selected at launch."""
+        account = self._find_account_by_email(email)
+        if not account:
+            raise AccountNotFoundError(f"No account found: {email}")
+        token = credentials.read_profile_token(profile)
+        result = {
+            "number": account.number,
+            "email": account.email,
+            "profile": str(profile),
+            "captured": False,
+        }
+        if not token:
+            result["reason"] = "no token in profile"
+            return result
+
+        email = credentials.email_from_token(token, allow_network=False)
+        if email and email.lower() != account.email.lower():
+            result["reason"] = f"profile token belongs to {email}"
+            return result
+
+        self._save_backup_if_fresher(account, token)
+        result["captured"] = True
+        result["expiry"] = credentials.token_expiry(token)
+        return result
+
     # -- mutations --------------------------------------------------------
 
     def add_current(self, email_override: Optional[str] = None) -> Account:
@@ -505,6 +593,9 @@ class AgySwitcher:
         removed_emails = {account.email.lower() for account in removed.values()}
         for account in removed.values():
             credentials.delete_token_backup(account.credential_number, account.email)
+            # The profile may still hold a live token after the account leaves
+            # the registry.  Drop the credential; keep history and settings.
+            credentials.delete_profile_token(paths.profile_gemini_dir(account.email))
         mirror = credentials.read_token_mirror()
         if mirror:
             mirror_email = credentials.email_from_token(mirror, allow_network=False)

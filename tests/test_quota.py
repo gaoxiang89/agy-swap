@@ -1,6 +1,10 @@
 import json
+import os
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest import mock
 
 from tests import bootstrap
 
@@ -175,6 +179,23 @@ class CacheTest(unittest.TestCase):
     def test_statusline_capture_rejects_payload_without_quota(self):
         self.assertIsNone(quota.statusline_capture({"email": "x@example.com"}))
 
+    def test_statusline_capture_uses_profile_email_when_payload_has_none(self):
+        payload = {k: v for k, v in REAL_STATUSLINE.items() if k != "email"}
+        with mock.patch.dict(
+            os.environ, {"AGYSWAP_PROFILE_EMAIL": "profile@example.com"}
+        ):
+            email = quota.statusline_capture(payload)
+        self.assertEqual(email, "profile@example.com")
+        entry = quota.load_cache()["accounts"]["profile@example.com"]
+        self.assertIn("gemini-weekly", entry["windows"])
+
+    def test_payload_email_beats_profile_email(self):
+        with mock.patch.dict(
+            os.environ, {"AGYSWAP_PROFILE_EMAIL": "profile@example.com"}
+        ):
+            email = quota.statusline_capture(REAL_STATUSLINE)
+        self.assertEqual(email, "user@example.com")
+
     def test_statusline_capture_merges_new_windows(self):
         quota.statusline_capture(REAL_STATUSLINE)
         changed = {
@@ -189,6 +210,45 @@ class CacheTest(unittest.TestCase):
         self.assertIn("gemini-weekly", entry["windows"])
         self.assertIn("five_hour", entry["windows"])
         self.assertEqual(entry["windows"]["five_hour"]["used_pct"], 50.0)
+
+    def test_concurrent_captures_preserve_both_accounts(self):
+        first_read = Event()
+        second_started = Event()
+        second_read = Event()
+        allow_first_write = Event()
+        load_cache = quota.load_cache
+
+        def pause_first_reader():
+            snapshot = load_cache()
+            if first_read.is_set():
+                second_read.set()
+            else:
+                first_read.set()
+                if not allow_first_write.wait(5):
+                    raise TimeoutError("first quota update was not released")
+            return snapshot
+
+        def capture_second():
+            second_started.set()
+            return quota.statusline_capture({**REAL_STATUSLINE, "email": "second@example.com"})
+
+        with mock.patch.object(quota, "load_cache", side_effect=pause_first_reader), \
+             ThreadPoolExecutor(2) as pool:
+            first = pool.submit(quota.statusline_capture, REAL_STATUSLINE)
+            try:
+                self.assertTrue(first_read.wait(5))
+                second = pool.submit(capture_second)
+                self.assertTrue(second_started.wait(5))
+                self.assertFalse(second_read.wait(0.25))
+            finally:
+                allow_first_write.set()
+            self.assertEqual(first.result(timeout=5), "user@example.com")
+            self.assertEqual(second.result(timeout=5), "second@example.com")
+
+        self.assertEqual(
+            set(quota.load_cache()["accounts"]),
+            {"user@example.com", "second@example.com"},
+        )
 
 
 class DescribeTest(unittest.TestCase):
